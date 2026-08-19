@@ -1,123 +1,284 @@
-# Awesome n8n + WhatsApp + MCP 🇹🇷🇳🇱
+<p align="center">
+  <img src="docs/assets/hero-banner.svg" alt="Dark technical banner titled n8n times WhatsApp times MCP, showing abstract connected automation nodes in orange, green and violet, with the supporting text: business automation workflows for Türkiye and the Netherlands" width="900" style="max-width:100%;" />
+</p>
 
-> A curated list of **real, working** [n8n](https://n8n.io) automations, WhatsApp Business Cloud API integrations, and [MCP](https://modelcontextprotocol.io) (Model Context Protocol) servers/tooling — with a specific focus on **business automation for the Turkish and Dutch (NL) markets**: appointment booking, customer support, and invoicing (BTW/KVK for NL, e-Fatura for TR).
+<h3 align="center">Practical n8n, WhatsApp and MCP automation resources for real businesses in Türkiye and the Netherlands.</h3>
 
-[![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
-![Maintenance](https://img.shields.io/badge/maintained-yes-green)
-![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
-![License](https://img.shields.io/badge/license-CC0--1.0-blue)
+<p align="center">
+  <a href="LICENSE"><img alt="License: CC0-1.0" src="https://img.shields.io/badge/license-CC0--1.0-blue"></a>
+  <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen">
+</p>
 
-This is not a link dump. Every entry here is either an official, verifiable resource or a real workflow that has actually been exported, sanitized, and tested — not a "we should add this someday" placeholder. See [Inclusion criteria](#inclusion-criteria) below.
+<p align="center">
+  <a href="#browse-verified-resources">Browse Resources</a> ·
+  <a href="#how-workflow-packages-work">Workflow Format</a> ·
+  <a href="#contributing">Contribute</a>
+</p>
 
-**Language note:** this README is English-first for global discoverability. The project's practical focus — invoicing rules, community links, market context — is Turkish (TR) and Dutch (NL) business automation, and some linked resources are in Turkish or Dutch accordingly.
+> [!NOTE]
+> **Current status:** the curated resource foundation is live. No runnable n8n workflow `.json` file has been published yet — see [Current status](#current-status) below for what that means in practice.
 
 ---
 
-## Table of Contents
+<details>
+<summary><strong>Table of contents</strong></summary>
 
-- [Why this list exists](#why-this-list-exists)
-- [Inclusion criteria](#inclusion-criteria)
-- [n8n — Setup & Infrastructure](#n8n--setup--infrastructure)
-- [n8n — WhatsApp Cloud API](#n8n--whatsapp-cloud-api)
-- [n8n — Postgres / Database Integration](#n8n--postgres--database-integration)
-- [n8n — Google Calendar / Appointment Scheduling](#n8n--google-calendar--appointment-scheduling)
-- [Invoicing / VAT / Accounting (NL & TR)](#invoicing--vat--accounting-nl--tr)
-- [MCP Servers](#mcp-servers)
-- [Claude Code Skills](#claude-code-skills)
-- [Workflows](#workflows)
+- [Current status](#current-status)
+- [Why this project exists](#why-this-project-exists)
+- [What you can find here](#what-you-can-find-here)
+- [Browse verified resources](#browse-verified-resources)
+- [How workflow packages work](#how-workflow-packages-work)
+- [How to use a published workflow](#how-to-use-a-published-workflow)
+- [Workflow quality requirements](#workflow-quality-requirements)
+- [Available and planned workflows](#available-and-planned-workflows)
+- [How validation works](#how-validation-works)
+- [Türkiye and Netherlands focus](#türkiye-and-netherlands-focus)
+- [Security and privacy](#security-and-privacy)
+- [Repository structure](#repository-structure)
 - [Contributing](#contributing)
-- [Security](#security)
-- [License](#license)
+- [Reporting a security issue](#reporting-a-security-issue)
+- [Support the project](#support-the-project)
+- [License and ownership](#license-and-ownership)
 
----
+</details>
 
-## Why this list exists
+## Current status
 
-General-purpose "awesome n8n" lists already exist and are large. What's missing is a list that:
-
-- Focuses specifically on the **n8n + WhatsApp Cloud API + Postgres** combination for real business use cases (not "hello world" demos).
-- Covers the **invoicing/VAT automation needs specific to the Dutch (ZZP/BTW/KVK) and Turkish markets** — resources that are otherwise scattered across local forums.
-- Requires every workflow submission to be **sanitized and genuinely tested**, not fabricated or copy-pasted from documentation examples.
-
-## Inclusion criteria
-
-An entry must meet **all** of the following before it's added:
-
-1. **It works.** Setup steps in its README have actually been followed and verified by the person opening the PR.
-2. **It's actively maintained** (a commit within the last 6 months), or it's a stable official reference (e.g. platform documentation) that doesn't need commit activity.
-3. **It solves a real problem** — not a toy/demo example.
-4. **Its license is clear** for commercial use.
-
-Placeholder entries, dead links, and "someone should build this" ideas are not accepted — see [CONTRIBUTING.md](CONTRIBUTING.md).
-
----
-
-## n8n — Setup & Infrastructure
-
-| Project | Description |
+| | |
 |---|---|
-| [n8n-io/n8n](https://github.com/n8n-io/n8n) | The core n8n repository — self-hosted workflow automation platform. |
-| [n8n-io/n8n-docker-caddy](https://github.com/n8n-io/n8n-docker-caddy) | Official Docker + Caddy setup for a self-hosted n8n instance with automatic HTTPS. |
+| ✅ | Curated resource foundation is live: verified official documentation and repositories for n8n, WhatsApp Cloud API, Postgres, Google Calendar, NL VAT/BTW, TR e-Fatura, and MCP. |
+| 🚧 | **No runnable workflow `.json` file has been published yet.** The `workflows/` folder currently defines the submission format only. |
+| 📦 | Workflow submissions require a real n8n export plus matching documentation — see [Workflow package contract](#how-workflow-packages-work). |
+| 🔍 | A workflow is only listed as available after sanitization, a clean import test, and passing [automated validation](#how-validation-works). |
 
-## n8n — WhatsApp Cloud API
+Nothing in this README is described as "production-tested" or "production-ready" until a real, sanitized workflow backs that claim.
+
+## Why this project exists
+
+General-purpose "awesome n8n" lists already exist and are large. What's missing is a resource specifically for the **n8n + WhatsApp Cloud API + Postgres** combination used in real business automation — appointment booking, customer support, invoicing — plus the invoicing and tax-compliance context specific to the **Dutch (ZZP/BTW/KVK)** and **Turkish (e-Fatura/e-Arşiv)** markets, which is otherwise scattered across local forums and undocumented in English.
+
+## What you can find here
+
+- A **verified resource library**: official documentation and primary repositories for n8n, WhatsApp Business Cloud API, Postgres, Google Calendar, MCP, and NL/TR invoicing systems — every link checked live before being added.
+- A strict **workflow package contract**: every future workflow ships as a matched `.json` export + `.md` documentation pair, sanitized and tested before being listed.
+- An **automated validation system** (`scripts/validate_repository.py` + CI) that checks workflow structure, required documentation, obvious secret patterns, and repository hygiene on every pull request.
+
+## Browse verified resources
+
+Every entry below is a live, specific, official link — not a placeholder or an organization homepage standing in for a project. See [Inclusion criteria](CONTRIBUTING.md) for how entries are vetted.
+
+### n8n Setup and Infrastructure
 
 | Resource | Description |
 |---|---|
-| [n8n WhatsApp Trigger node docs](https://docs.n8n.io/integrations/builtin/trigger-nodes/n8n-nodes-base.whatsapptrigger/) | Official node documentation for receiving inbound WhatsApp messages via the Meta Cloud API webhook. |
+| [n8n-io/n8n](https://github.com/n8n-io/n8n) | The core n8n repository — self-hosted workflow automation platform. |
+| [n8n-io/n8n-docker-caddy](https://github.com/n8n-io/n8n-docker-caddy) | Official Docker + Caddy setup for self-hosted n8n with automatic HTTPS. |
+
+### WhatsApp Business Cloud API
+
+| Resource | Description |
+|---|---|
+| [n8n WhatsApp Trigger node docs](https://docs.n8n.io/integrations/builtin/trigger-nodes/n8n-nodes-base.whatsapptrigger/) | Official node docs for receiving inbound messages via the Meta Cloud API webhook. |
 | [Meta WhatsApp Cloud API docs](https://developers.facebook.com/docs/whatsapp/cloud-api) | Official Meta reference for the WhatsApp Business Cloud API. |
-| [WhatsApp Cloud API webhook setup guide](https://developers.facebook.com/docs/whatsapp/cloud-api/guides/set-up-webhooks) | Official guide for configuring and verifying webhooks — the step most beginners get stuck on. |
+| [WhatsApp Cloud API webhook setup guide](https://developers.facebook.com/docs/whatsapp/cloud-api/guides/set-up-webhooks) | Official guide for configuring and verifying webhooks. |
 
-Real, sanitized WhatsApp automation workflows (appointment reminders, order-status notifications, support routing) belong in [`workflows/`](workflows/README.md) as matched `.json` + `.md` pairs — see that folder for current status and submission format.
-
-## n8n — Postgres / Database Integration
+### Postgres
 
 | Resource | Description |
 |---|---|
 | [n8n Postgres node docs](https://docs.n8n.io/integrations/builtin/app-nodes/n8n-nodes-base.postgres/) | Official documentation for CRUD operations and connection settings. |
 
-## n8n — Google Calendar / Appointment Scheduling
+### Google Calendar
 
 | Resource | Description |
 |---|---|
 | [n8n Google Calendar node docs](https://docs.n8n.io/integrations/builtin/app-nodes/n8n-nodes-base.googlecalendar/) | Official documentation for OAuth setup and event CRUD operations. |
 
-## Invoicing / VAT / Accounting (NL & TR)
+### Netherlands VAT / BTW
 
 | Resource | Description |
 |---|---|
-| [Belastingdienst — BTW voor ondernemers](https://www.belastingdienst.nl/wps/wcm/connect/bldcontenten/belastingdienst/business/vat/vat) | Official Dutch tax authority reference for VAT (BTW) rules applicable to freelancers/ZZP and businesses. |
+| [Belastingdienst — BTW voor ondernemers](https://www.belastingdienst.nl/wps/wcm/connect/bldcontenten/belastingdienst/business/vat/vat) | Official Dutch tax authority reference for VAT (BTW) rules for freelancers (ZZP) and businesses. |
+
+### Türkiye e-Fatura / e-Arşiv
+
+| Resource | Description |
+|---|---|
 | [e-Fatura Portalı (GİB)](https://www.efatura.gov.tr/) | Official Turkish Revenue Administration portal for e-Invoice (e-Fatura) / e-Archive (e-Arşiv) systems. |
 
-## MCP Servers
+### MCP Servers and SDKs
 
-| Project | Description |
+| Resource | Description |
 |---|---|
 | [modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers) | The official reference collection of MCP servers. |
-| [modelcontextprotocol/typescript-sdk](https://github.com/modelcontextprotocol/typescript-sdk) | Official TypeScript SDK for building your own MCP server. |
+| [modelcontextprotocol/typescript-sdk](https://github.com/modelcontextprotocol/typescript-sdk) | Official TypeScript SDK for building an MCP server. |
 | [MCP quickstart — build a server](https://modelcontextprotocol.io/quickstart/server) | Official step-by-step guide to writing an MCP server from scratch. |
 
-## Claude Code Skills
+### Claude Code Skills
 
-| Project | Description |
+| Resource | Description |
 |---|---|
 | [ComposioHQ/awesome-claude-skills](https://github.com/ComposioHQ/awesome-claude-skills) | A large curated collection of Claude Code skills and plugins. |
 
-## Workflows
+None of the above are personally claimed as "tested in production" here — they are official references and primary sources. Where a resource has actually been run and verified by a contributor, that's stated explicitly in its entry.
 
-See [`workflows/README.md`](workflows/README.md) for the sanitized n8n workflow JSON files in this repository, the submission format, and the mandatory sanitization checklist.
+## How workflow packages work
 
-**No workflow is described as "production-tested" until a real, sanitized `.json` export backing that claim has been added and validated.** Currently the `workflows/` folder contains only the submission format and template — no workflow files have been added yet.
+Every workflow lives in `workflows/` as a **matched pair** — never a `.json` on its own:
 
----
+```text
+workflows/
+  workflow-slug.json
+  workflow-slug.md
+```
+
+- `workflow-slug.json` — exported directly from n8n (Workflow menu → **Download**), sanitized, never hand-authored.
+- `workflow-slug.md` — documentation covering what it does, real use case, required n8n version, required nodes, required credentials, environment variables/placeholders, setup steps, test procedure, known limitations, data handled, license/source, and last verification date (full list in [Workflow quality requirements](#workflow-quality-requirements)).
+
+**Credentials are never embedded in a workflow export.** Anyone using a published workflow must create the required credentials manually inside their own n8n instance — the JSON only ever references a credential by name/type, never by stored value or live ID.
+
+## How to use a published workflow
+
+Once workflows are published, follow this sequence for every one of them:
+
+1. **Read the `.md` file first** — don't import blind.
+2. Review the services, nodes, and data access it requires.
+3. Download the matching `.json` export.
+4. Import it into your own n8n instance.
+5. Create the required credentials manually inside n8n.
+6. Replace every documented placeholder (tokens, phone IDs, webhook URLs) with your own values.
+7. **Keep the workflow inactive** while you test it.
+8. Run it once with synthetic test data — not real customer data.
+9. Inspect every outbound action it takes (messages sent, records written, requests made) before trusting it.
+10. Activate it only after it passes your own testing.
+
+No workflow is available to download yet, so there's nothing to run today — this is the process that will apply as soon as the first package is published.
+
+## Workflow quality requirements
+
+Every `workflow-slug.md` file must contain each of the following sections:
+
+| Required section | Purpose |
+|---|---|
+| What it does | Plain-language summary of the automation |
+| Real business use case | The actual problem it solves — not a demo |
+| Required n8n version | Exact version it was built and tested against |
+| Required nodes | Every node type needed to run it |
+| Required credentials | Credential types by name — never values |
+| Environment variables | Placeholders to fill in, with example (non-real) values |
+| Setup steps | Numbered, reproducible steps |
+| Test procedure | How the contributor actually tested it |
+| Known limitations | What it doesn't handle |
+| Data handled | What kind of business/customer data flows through it |
+| License and source | License for reuse, and whether it's original or adapted |
+| Last verification date | When it was last confirmed to still work |
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full sanitization checklist that applies before any of this is submitted.
+
+## Available and planned workflows
+
+### Available now
+
+| Workflow | Status |
+|---|---|
+| _None yet_ | No sanitized, validated workflow package has been published. |
+
+### Planned roadmap
+
+These are **planned, not available** — no `.json` file exists for any of them yet. No release dates are given because none have been set.
+
+| Workflow | Status |
+|---|---|
+| WhatsApp appointment reminder | Planned — not available yet |
+| WhatsApp appointment confirmation and cancellation | Planned — not available yet |
+| Incoming WhatsApp support routing | Planned — not available yet |
+| Google Calendar ↔ Postgres synchronization | Planned — not available yet |
+| Unpaid invoice reminder | Planned — not available yet |
+| Customer quotation delivery | Planned — not available yet |
+| n8n workflow execution through MCP | Planned — not available yet |
+
+Full detail: [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+## How validation works
+
+Every pull request runs through an automated, dependency-free check before anything is merged:
+
+```mermaid
+flowchart TD
+    A[Real n8n export] --> B[Sanitization]
+    B --> C[Automated validation]
+    C --> D[Human review]
+    D --> E[Published workflow package]
+```
+
+`scripts/validate_repository.py` (Python standard library only) checks, on every push and pull request via `.github/workflows/validate.yml`:
+
+- Every `workflows/*.json` has a matching `.md`, and vice versa.
+- The JSON root is an object with non-empty `nodes` and a `connections` object.
+- Obvious secret patterns, realistic phone numbers, private webhook URLs, and unplaceholdered emails are rejected — documented synthetic placeholders (`YOUR_TOKEN_HERE`, `example.com`, etc.) are allowed.
+- Required documentation headings are present in every workflow `.md`.
+- Internal Markdown links resolve.
+- Repository SVGs are well-formed and contain no `<script>`, `<foreignObject>`, event handlers, or remote references.
+
+This is a **defensive quality gate, not a guarantee** — it cannot detect every possible secret or unsafe pattern. Human review of every workflow before import and activation is still required.
+
+## Türkiye and Netherlands focus
+
+WhatsApp is the dominant business messaging channel in both Türkiye and the Netherlands, and both markets have automation-relevant compliance requirements that general English-language n8n resources don't cover: Dutch BTW/KVK rules for freelancers and small businesses, and Turkish e-Fatura/e-Arşiv electronic invoicing. This project curates and, over time, publishes real automation packages built around those specific requirements — appointment workflows, invoice reminders, and customer communication — rather than generic demos.
+
+## Security and privacy
+
+- Workflow exports must **never** contain live credentials.
+- Every node must be reviewed before import and before activation — don't trust an import blindly.
+- Example/test data in any workflow or documentation must be synthetic, never real customer data.
+- Repository checks (see [How validation works](#how-validation-works)) reduce risk but **cannot guarantee** detection of every secret or unsafe behavior.
+- Importing any third-party automation always requires human review — that applies here too.
+
+Full policy: [`SECURITY.md`](SECURITY.md).
+
+## Repository structure
+
+```text
+.
+├── .github/
+│   ├── PULL_REQUEST_TEMPLATE.md
+│   └── workflows/
+│       └── validate.yml
+├── .gitignore
+├── CONTRIBUTING.md
+├── LICENSE
+├── README.md
+├── SECURITY.md
+├── docs/
+│   ├── ROADMAP.md
+│   └── assets/
+│       └── hero-banner.svg
+├── scripts/
+│   └── validate_repository.py
+└── workflows/
+    └── README.md
+```
+
+There is no application code, no Docker setup, and no package manifest in this repository — it's a resource catalog and a workflow-package validation contract, not a runnable product.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full process, PR checklist, and data-sanitization rules.
+Adding a resource link or a workflow package both go through a pull request — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full process, the PR checklist, and the mandatory sanitization rules. The [PR template](.github/PULL_REQUEST_TEMPLATE.md) walks through exactly what to fill in.
 
-## Security
+## Reporting a security issue
 
-See [SECURITY.md](SECURITY.md) for how to report an accidentally exposed secret (API key, token, phone number, webhook URL, etc.) found anywhere in this repository.
+If you find an accidentally exposed secret (API key, token, phone number, webhook URL, credential, or other sensitive data) anywhere in this repository, **do not open a public issue quoting it**. Report it privately — see [`SECURITY.md`](SECURITY.md) for how.
 
-## License
+## Support the project
 
-[CC0 1.0 Universal](LICENSE) — this list's curation (README, CONTRIBUTING, and related project files) is released into the public domain. Every third-party project linked here is subject to its own license — check the linked project's own LICENSE file before use.
+Maintained by Studivox, with development supported by DEDU LTD.
+
+<!-- MAINTENANCE NOTE: GitHub Sponsors for DEDU LTD is pending approval and is not yet public. Once the sponsors listing is confirmed live and accepting sponsorships, replace the note below with a sponsor badge/link — do not add one before that is confirmed. -->
+
+> GitHub Sponsors support is being prepared under DEDU LTD. A verified sponsorship link will be added after approval.
+
+## License and ownership
+
+This project's curation — README, CONTRIBUTING, SECURITY, and related project files — is released under [CC0 1.0 Universal](LICENSE): public domain, use it however you like. Every third-party project or resource linked from this repository is subject to its own license — check the linked project's own license before use.
+
+This repository is maintained under the Studivox GitHub organization.
