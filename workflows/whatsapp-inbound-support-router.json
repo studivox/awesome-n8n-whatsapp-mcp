@@ -1,0 +1,99 @@
+{
+  "id": "0CNpd9biHWswuHIp",
+  "name": "WhatsApp Inbound Support Router",
+  "nodes": [
+    {
+      "id": "039b402e-4666-4405-86c3-c13505bc98c8",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        250,
+        380
+      ],
+      "webhookId": "4d75e1da-dac5-4708-84d1-3a26c9f25bb8",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-inbound-support-router",
+        "authentication": "none",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "ba76a38f-3f4e-4236-a2bd-5538529fc96d",
+      "name": "Production Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        200,
+        120
+      ],
+      "parameters": {
+        "content": "## Before production use\\n\\n- This workflow does **not** verify Meta webhook authenticity. Add signature verification (X-Hub-Signature-256, per Meta's WhatsApp Cloud API docs) before exposing this publicly.\\n- Classification below is deterministic keyword matching, not AI/ML. Adapt keywords and languages to your business.\\n- This workflow never sends a message and never stores data -- it only returns a routing decision.",
+        "height": 220,
+        "width": 460
+      }
+    },
+    {
+      "id": "ee39c42d-c4cc-4378-8b2a-c28b56c38471",
+      "name": "Normalize, Validate & Classify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Normalize the inbound WhatsApp Cloud API webhook payload, safely extract the\n// first inbound text message, and classify it with deterministic keyword routing.\n// This is a template for demonstration/testing -- adapt keywords and languages\n// to your own business before production use.\n\nconst item = $input.first().json;\nconst payload = item.body !== undefined ? item.body : item;\n\nfunction safeGet(obj, path, fallback) {\n  try {\n    let cur = obj;\n    for (const key of path) {\n      if (cur === null || cur === undefined) return fallback;\n      cur = cur[key];\n    }\n    return cur === undefined ? fallback : cur;\n  } catch (e) {\n    return fallback;\n  }\n}\n\nlet result;\n\ntry {\n  if (!payload || typeof payload !== 'object') {\n    result = { route: null, messageType: 'malformed', status: 'ignored', reason: 'missing_or_invalid_payload' };\n  } else {\n    const entry = safeGet(payload, ['entry', 0], null);\n    const change = entry ? safeGet(entry, ['changes', 0], null) : null;\n    const value = change ? safeGet(change, ['value'], null) : null;\n\n    if (!value) {\n      result = { route: null, messageType: 'malformed', status: 'ignored', reason: 'unrecognized_payload_structure' };\n    } else {\n      const messages = Array.isArray(value.messages) ? value.messages : [];\n      const statuses = Array.isArray(value.statuses) ? value.statuses : [];\n\n      if (messages.length === 0) {\n        if (statuses.length > 0) {\n          result = { route: null, messageType: 'status_event', status: 'ignored', reason: 'delivery_status_only' };\n        } else {\n          result = { route: null, messageType: 'malformed', status: 'ignored', reason: 'no_inbound_message_found' };\n        }\n      } else {\n        const firstMessage = messages[0];\n        const msgType = firstMessage.type;\n        const text = msgType === 'text' ? safeGet(firstMessage, ['text', 'body'], '') : '';\n\n        if (msgType !== 'text' || !text || typeof text !== 'string' || text.trim() === '') {\n          result = { route: null, messageType: msgType || 'unknown', status: 'ignored', reason: 'unsupported_or_empty_message_content' };\n        } else {\n          const normalized = text.trim().toLowerCase();\n\n          // Deterministic keyword routing -- not AI/ML. Adapt to your language(s)\n          // and vocabulary; this is a starting template, not a finished classifier.\n          const KEYWORDS = {\n            appointments: ['appointment', 'book', 'booking', 'schedule', 'reschedule', 'reserve', 'reservation'],\n            billing: ['invoice', 'bill', 'billing', 'payment', 'pay ', 'charge', 'refund', 'receipt', 'subscription'],\n            support: ['help', 'support', 'issue', 'problem', 'not working', 'broken', 'error', 'trouble'],\n          };\n\n          let route = 'general';\n          for (const [category, keywords] of Object.entries(KEYWORDS)) {\n            if (keywords.some((k) => normalized.includes(k))) {\n              route = category;\n              break;\n            }\n          }\n\n          result = { route, messageType: 'text', status: 'classified' };\n        }\n      }\n    }\n  }\n} catch (err) {\n  result = { route: null, messageType: 'malformed', status: 'ignored', reason: 'processing_error' };\n}\n\nreturn [{ json: result }];\n"
+      }
+    },
+    {
+      "id": "462ab26c-b938-4e6b-9347-77c1e5a409bc",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        800,
+        380
+      ],
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize, Validate & Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize, Validate & Classify": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": []
+}

@@ -1,8 +1,14 @@
 # Workflow Roadmap
 
-This tracks planned workflow packages for this repository. **Nothing in this document is available today** — every entry below is planned only, with no `.json` export or documentation published yet. No release dates are given because none have been set.
+This tracks workflow packages for this repository — both shipped and planned. Planned entries have no `.json` export or documentation yet, and no release dates are given because none have been set.
 
-A workflow moves out of this list and into [`workflows/`](../workflows/README.md) only after it has been sanitized, documented per the [Workflow quality requirements](../README.md#workflow-quality-requirements), successfully re-imported into a clean n8n instance, and passed [automated validation](../README.md#how-validation-works).
+A workflow moves out of the planned list and into [`workflows/`](../workflows/README.md) only after it has been sanitized, documented per the [Workflow quality requirements](../README.md#workflow-quality-requirements), successfully re-imported into a clean n8n instance, and passed [automated validation](../README.md#how-validation-works).
+
+## Available
+
+| Workflow | Files | Notes |
+|---|---|---|
+| WhatsApp inbound support router | [`.json`](../workflows/whatsapp-inbound-support-router.json) · [`.md`](../workflows/whatsapp-inbound-support-router.md) | Deterministic keyword routing into appointments/billing/support/general. Sanitized, tested, re-import verified. Not production-ready — see its documented limitations. |
 
 ## Planned workflows
 
@@ -10,7 +16,6 @@ A workflow moves out of this list and into [`workflows/`](../workflows/README.md
 |---|---|---|
 | WhatsApp appointment reminder | Planned — not available yet | Sends a reminder ahead of a scheduled appointment. |
 | WhatsApp appointment confirmation and cancellation | Planned — not available yet | Handles the confirm/cancel reply flow for a booking. |
-| Incoming WhatsApp support routing | Planned — not available yet | Routes inbound messages to the right handler by keyword/intent. |
 | Google Calendar ↔ Postgres synchronization | Planned — not available yet | Keeps appointment records and calendar events in sync. |
 | Unpaid invoice reminder | Planned — not available yet | Automated follow-up for overdue invoices. |
 | Customer quotation delivery | Planned — not available yet | Generates and delivers a quotation to a customer. |

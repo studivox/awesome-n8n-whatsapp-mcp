@@ -86,7 +86,10 @@ SECRET_PATTERNS = [
     ),
 ]
 
-PHONE_PATTERN = re.compile(r"\+?\d[\d\-\s]{8,16}\d")
+# Excludes matches embedded inside hyphenated hex identifiers (e.g. n8n node/
+# webhook UUIDs like "039b402e-4666-4405-86c3-..."), which otherwise false-
+# positive as phone numbers since UUIDs are digit-and-hyphen-heavy.
+PHONE_PATTERN = re.compile(r"(?<![0-9a-fA-F-])\+?\d[\d\-\s]{8,16}\d(?![0-9a-fA-F-])")
 WEBHOOK_URL_PATTERN = re.compile(r"https?://[^\s\"'<>]*webhook[^\s\"'<>]*", re.IGNORECASE)
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+\-]+@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
 MD_LINK_PATTERN = re.compile(r"\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
