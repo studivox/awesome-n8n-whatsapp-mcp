@@ -1,0 +1,99 @@
+{
+  "id": "sVYMBqA5QjrEZ6D9",
+  "name": "WhatsApp Inbound Support Router",
+  "nodes": [
+    {
+      "id": "3559bfce-8727-4f3b-a8aa-8c2e3095d06c",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        250,
+        380
+      ],
+      "webhookId": "58779ece-4573-454a-8b47-70e74535d1e2",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-inbound-support-router",
+        "authentication": "none",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "7e51b560-18d5-479f-8015-6c46b6ce0e09",
+      "name": "Production Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        180,
+        100
+      ],
+      "parameters": {
+        "content": "## Before production use\\n\\n- **POST-only.** This workflow does NOT implement Meta's required GET verification handshake or X-Hub-Signature-256 signature validation. Do not point Meta's webhook configuration directly at this URL as-is.\\n- **Testing:** exercise this webhook with any synthetic HTTP client (curl, Postman, etc.) sending POST requests with test payloads.\\n- **Direct Meta integration** requires adding a separate GET verification endpoint and POST signature validation before this is publicly exposed.\\n- Classification is deterministic word/phrase matching, not AI/ML. Adapt keywords and languages to your business.\\n- This workflow never sends a message and never stores data -- it only returns a routing decision.",
+        "height": 260,
+        "width": 500
+      }
+    },
+    {
+      "id": "7e0097c0-ca0d-446d-b663-a85932a4a946",
+      "name": "Normalize, Validate & Classify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Normalize the inbound WhatsApp Cloud API webhook payload, safely extract the\n// first inbound text message, and classify it with deterministic, word/phrase-aware\n// keyword routing. This is a template for demonstration/testing -- adapt keywords\n// and languages to your own business before production use.\n//\n// NOTE: this endpoint is POST-only. It does NOT implement Meta's required GET\n// verification handshake or X-Hub-Signature-256 signature validation. Test it\n// with any synthetic HTTP client; do not point Meta's webhook config at it\n// as-is -- see this workflow's documentation for what a production setup needs.\n\nconst item = $input.first().json;\nconst payload = item.body !== undefined ? item.body : item;\n\nfunction safeGet(obj, path, fallback) {\n  try {\n    let cur = obj;\n    for (const key of path) {\n      if (cur === null || cur === undefined) return fallback;\n      cur = cur[key];\n    }\n    return cur === undefined ? fallback : cur;\n  } catch (e) {\n    return fallback;\n  }\n}\n\n// Word/phrase-aware matcher: uses \\b boundaries so \"book\" won't match inside\n// \"Facebook\" and \"bill\" won't match inside \"billion\". Multi-word phrases (e.g.\n// \"not working\") match as a phrase with flexible whitespace between words.\nfunction buildMatcher(keyword) {\n  const escaped = keyword.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n  const pattern = escaped.includes(' ') ? escaped.replace(/ /g, '\\\\s+') : escaped;\n  return new RegExp('\\\\b' + pattern + '\\\\b');\n}\n\nfunction matchesAny(text, keywords) {\n  return keywords.some((k) => buildMatcher(k).test(text));\n}\n\nlet result;\n\ntry {\n  if (!payload || typeof payload !== 'object') {\n    result = { route: null, messageType: 'malformed', status: 'ignored' };\n  } else {\n    const entry = safeGet(payload, ['entry', 0], null);\n    const change = entry ? safeGet(entry, ['changes', 0], null) : null;\n    const value = change ? safeGet(change, ['value'], null) : null;\n\n    if (!value) {\n      result = { route: null, messageType: 'malformed', status: 'ignored' };\n    } else {\n      const messages = Array.isArray(value.messages) ? value.messages : [];\n      const statuses = Array.isArray(value.statuses) ? value.statuses : [];\n\n      if (messages.length === 0) {\n        if (statuses.length > 0) {\n          result = { route: null, messageType: 'status_event', status: 'ignored' };\n        } else {\n          result = { route: null, messageType: 'malformed', status: 'ignored' };\n        }\n      } else {\n        const firstMessage = messages[0];\n        const msgType = firstMessage.type;\n        const text = msgType === 'text' ? safeGet(firstMessage, ['text', 'body'], '') : '';\n\n        if (msgType !== 'text' || !text || typeof text !== 'string' || text.trim() === '') {\n          result = { route: null, messageType: msgType || 'unknown', status: 'ignored' };\n        } else {\n          const normalized = text.trim().toLowerCase();\n\n          // Deterministic keyword routing -- not AI/ML. Adapt to your language(s)\n          // and vocabulary; this is a starting template, not a finished classifier.\n          const KEYWORDS = {\n            appointments: ['appointment', 'book', 'booking', 'schedule', 'reschedule', 'reserve', 'reservation'],\n            billing: ['invoice', 'bill', 'billing', 'payment', 'pay', 'charge', 'refund', 'receipt', 'subscription'],\n            support: ['help', 'support', 'issue', 'problem', 'not working', 'broken', 'error', 'trouble'],\n          };\n\n          let route = 'general';\n          for (const [category, keywords] of Object.entries(KEYWORDS)) {\n            if (matchesAny(normalized, keywords)) {\n              route = category;\n              break;\n            }\n          }\n\n          result = { route, messageType: 'text', status: 'classified' };\n        }\n      }\n    }\n  }\n} catch (err) {\n  result = { route: null, messageType: 'malformed', status: 'ignored' };\n}\n\nreturn [{ json: result }];\n"
+      }
+    },
+    {
+      "id": "584ab183-3c79-4969-b2e2-57b35e055a02",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        800,
+        380
+      ],
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize, Validate & Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize, Validate & Classify": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": []
+}

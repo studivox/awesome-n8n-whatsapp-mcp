@@ -17,7 +17,7 @@
 </p>
 
 > [!NOTE]
-> **Current status:** the curated resource foundation is live. No runnable n8n workflow `.json` file has been published yet — see [Current status](#current-status) below for what that means in practice.
+> **Current status:** the curated resource foundation is live, and the first sanitized, tested workflow package has been published. See [Current status](#current-status) below for exactly what that does and doesn't mean.
 
 ---
 
@@ -48,11 +48,12 @@
 | | |
 |---|---|
 | ✅ | Curated resource foundation is live: verified official documentation and repositories for n8n, WhatsApp Cloud API, Postgres, Google Calendar, MCP, and regional compliance references (VAT/BTW, e-Fatura). |
-| 🚧 | **No runnable workflow `.json` file has been published yet.** The `workflows/` folder currently defines the submission format only. |
+| ✅ | One sanitized, tested workflow package is published — see [Available and planned workflows](#available-and-planned-workflows). It is **not** described as production-ready or production-tested; it's a verified template with documented limitations. |
+| 🚧 | Everything else in the [planned roadmap](#available-and-planned-workflows) remains unbuilt. |
 | 📦 | Workflow submissions require a real n8n export plus matching documentation — see [Workflow package contract](#how-workflow-packages-work). |
 | 🔍 | A workflow is only listed as available after sanitization, a clean import test, and passing [automated validation](#how-validation-works). |
 
-Nothing in this README is described as "production-tested" or "production-ready" until a real, sanitized workflow backs that claim.
+Nothing in this README is described as "production-tested" or "production-ready." The one published workflow is described as tested and verified — with its exact scope and limitations documented alongside it — never as more than that.
 
 ## Why this project exists
 
@@ -146,7 +147,7 @@ workflows/
 
 ## How to use a published workflow
 
-Once workflows are published, follow this sequence for every one of them:
+Follow this sequence for every published workflow (including the one currently available — see [Available and planned workflows](#available-and-planned-workflows)):
 
 1. **Read the `.md` file first** — don't import blind.
 2. Review the services, nodes, and data access it requires.
@@ -158,8 +159,6 @@ Once workflows are published, follow this sequence for every one of them:
 8. Run it once with synthetic test data — not real customer data.
 9. Inspect every outbound action it takes (messages sent, records written, requests made) before trusting it.
 10. Activate it only after it passes your own testing.
-
-No workflow is available to download yet, so there's nothing to run today — this is the process that will apply as soon as the first package is published.
 
 ## Workflow quality requirements
 
@@ -186,9 +185,9 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full sanitization checklist tha
 
 ### Available now
 
-| Workflow | Status |
-|---|---|
-| _None yet_ | No sanitized, validated workflow package has been published. |
+| Workflow | Files | Status |
+|---|---|---|
+| WhatsApp inbound support router | [`.json`](workflows/whatsapp-inbound-support-router.json) · [`.md`](workflows/whatsapp-inbound-support-router.md) | Available — sanitized, tested, re-import verified. **Not** described as production-ready; see the workflow's own [Known limitations](workflows/whatsapp-inbound-support-router.md#known-limitations). |
 
 ### Planned roadmap
 
@@ -198,7 +197,6 @@ These are **planned, not available** — no `.json` file exists for any of them 
 |---|---|
 | WhatsApp appointment reminder | Planned — not available yet |
 | WhatsApp appointment confirmation and cancellation | Planned — not available yet |
-| Incoming WhatsApp support routing | Planned — not available yet |
 | Google Calendar ↔ Postgres synchronization | Planned — not available yet |
 | Unpaid invoice reminder | Planned — not available yet |
 | Customer quotation delivery | Planned — not available yet |
