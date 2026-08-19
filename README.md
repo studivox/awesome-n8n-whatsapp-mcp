@@ -7,6 +7,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: CC0-1.0" src="https://img.shields.io/badge/license-CC0--1.0-blue"></a>
   <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen">
+  <a href="https://github.com/studivox/awesome-n8n-whatsapp-mcp/actions/workflows/validate.yml"><img alt="Validate Repository" src="https://github.com/studivox/awesome-n8n-whatsapp-mcp/actions/workflows/validate.yml/badge.svg"></a>
 </p>
 
 <p align="center">
