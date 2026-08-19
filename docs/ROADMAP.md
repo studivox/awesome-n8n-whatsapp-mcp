@@ -10,12 +10,13 @@ A workflow moves out of the planned list and into [`workflows/`](../workflows/RE
 |---|---|---|
 | WhatsApp inbound support router | [`.json`](../workflows/whatsapp-inbound-support-router.json) · [`.md`](../workflows/whatsapp-inbound-support-router.md) | Deterministic keyword routing into appointments/billing/support/general. Sanitized, tested, re-import verified. Not production-ready — see its documented limitations. |
 | WhatsApp appointment reply parser | [`.json`](../workflows/whatsapp-appointment-reply-parser.json) · [`.md`](../workflows/whatsapp-appointment-reply-parser.md) | Classifies a customer's free-text reply as confirmed/cancelled/reschedule_requested/manual_review. A **building block, not the full automation** — it does not touch a calendar or database, and does not send any message. Sanitized, tested, re-import verified. Not production-ready. |
+| WhatsApp template message sender | [`.json`](../workflows/whatsapp-template-message-sender.json) · [`.md`](../workflows/whatsapp-template-message-sender.md) | Reusable sub-workflow (Execute Workflow Trigger) that sends one approved WhatsApp template message and returns controlled delivery metadata. A **building block**, not a scheduler or reminder system on its own — other planned workflows below (appointment reminder, invoice reminder, quotation delivery) would call this rather than duplicate the send logic. Tested against a local mock server only, never live Meta. Sanitized, re-import verified. Not production-ready. |
 
 ## Planned workflows
 
 | Workflow | Status | Notes |
 |---|---|---|
-| WhatsApp appointment reminder | Planned — not available yet | Sends a reminder ahead of a scheduled appointment. |
+| WhatsApp appointment reminder | Planned — not available yet | Sends a reminder ahead of a scheduled appointment. Would call the available "WhatsApp template message sender" rather than reimplement the send step. |
 | WhatsApp appointment confirmation and cancellation | Planned — not available yet | The full calendar/database-updating automation. The available "WhatsApp appointment reply parser" above only classifies the customer's reply text — this planned item is the end-to-end automation that would act on that classification. |
 | Google Calendar ↔ Postgres synchronization | Planned — not available yet | Keeps appointment records and calendar events in sync. |
 | Unpaid invoice reminder | Planned — not available yet | Automated follow-up for overdue invoices. |
