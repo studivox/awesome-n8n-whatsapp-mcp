@@ -123,7 +123,7 @@ Testing was split, for the same reason the sender's own testing is split (see [i
 | 12 | Invalid `sendWindowMinutes` (e.g. zero) | `rejected`, zero sender calls | real committed files |
 | 13 | Invalid sender-bound input (e.g. malformed `templateName`) despite being otherwise due | `rejected` before any sub-workflow call, zero sender calls | real committed files |
 | 14 | Valid reminder with `bodyParameters` | `sent`, parameters correctly forwarded to the sender | mock-bound pair |
-| 15 | Sender success | `sent`, real `providerMessageId` returned | mock-bound pair |
+| 15 | Sender success | `sent`, synthetic mock `providerMessageId` returned | mock-bound pair |
 | 16 | Sender HTTP 400 | `provider_rejected`, `httpStatus: 400` | mock-bound pair |
 | 17 | Sender HTTP 401 | `auth_error`, `httpStatus: 401` | mock-bound pair |
 | 18 | Sender HTTP 429 | `rate_limited`, `httpStatus: 429` | mock-bound pair |
@@ -134,6 +134,29 @@ Testing was split, for the same reason the sender's own testing is split (see [i
 | 23 | Execution history/API/SQLite persistence behavior | See [Persistence verification](#persistence-verification) below | real committed files (reminder side); mock-bound pair (sender side, standing in for the real sender's own already-verified settings) |
 | 24 | Clean export/import preserves settings and logic | Exported the real committed workflow via the official CLI, imported into a clean instance, exported again — `settings`, `nodes`, and `connections` were byte-for-byte identical | real committed files |
 | 25 | Second clean instance produces identical results | A genuinely separate, freshly-initialized n8n instance (fresh empty data directory) reproduced every applicable result above identically, including confirming the sender-by-id reference resolved correctly without manual rebinding | real committed files (timing/validation cases) + a fresh mock-bound pair built on that same clean instance (due-path cases) |
+
+**Correction round: invalid-identifier leakage and strict calendar-date validation.** A review found that `appointmentId` was echoed back on the `rejected` branch based only on `typeof appointmentId === 'string'`, not on the identifier itself passing validation — an oversized, invalid-character, or otherwise attacker-controlled string could be echoed back unbounded. Separately, `appointmentStart` validation relied on a regex plus `Date.parse()`, and JavaScript's `Date` silently normalizes impossible calendar dates (e.g. `2026-02-30` rolls over into March) rather than rejecting them. Both were fixed and re-verified live against n8n v2.35.4:
+
+| # | Test | Result | Verified via |
+|---|---|---|---|
+| 26 | Oversized `appointmentId` (300 characters) | `rejected`, `appointmentId: null`, zero sender calls | real committed files |
+| 27 | Invalid-character `appointmentId` (contains a space) | `rejected`, `appointmentId: null`, zero sender calls | real committed files |
+| 28 | Secret-like/injection-shaped `appointmentId` (SQL/script-injection-shaped string) | `rejected`, `appointmentId: null`, zero sender calls | real committed files |
+| 29 | Valid `appointmentId` combined with another invalid field (e.g. bad `recipient`) | `rejected`, but `appointmentId` is still echoed — it passed validation itself | real committed files |
+| 30 | February 30 | `rejected`, zero sender calls | real committed files |
+| 31 | April 31 | `rejected`, zero sender calls | real committed files |
+| 32 | February 29 in a non-leap year (2026) | `rejected`, zero sender calls | real committed files |
+| 33 | February 29 in a leap year (2028) | Accepted as a valid timestamp (not `rejected`) | real committed files |
+| 34 | Month 13 | `rejected`, zero sender calls | real committed files |
+| 35 | Hour 24 | `rejected`, zero sender calls | real committed files |
+| 36 | Invalid timezone offset (`+15:00`, `+14:30`, `-13:00`) | `rejected`, zero sender calls | real committed files |
+| 37 | Timezone-less timestamp | `rejected`, zero sender calls | real committed files |
+| 38 | Valid `Z` timestamp | Accepted as a valid timestamp | real committed files |
+| 39 | Valid positive-offset timestamp (e.g. `+03:00`) | Accepted as a valid timestamp | real committed files |
+| 40 | Valid negative-offset timestamp (e.g. `-05:00`) | Accepted as a valid timestamp | real committed files |
+| 41 | Clean export/import after the correction | Exported the corrected workflow via the official CLI, imported into a second clean instance, re-ran cases 26–40 there — identical results, and the sender-by-id reference still resolved without manual rebinding | real committed files, second clean instance |
+
+Every rejected case in this correction round was confirmed, via each execution's recorded node history, to have made zero calls to `Call Sender` — the same structural guarantee (the `Due Now?` IF node) that already covered every other rejection case above.
 
 An earlier, exploratory feasibility check (confirming that an Execute Workflow node with `mode: "id"` can call a sub-workflow at all) was run once against the real, unmodified sender with synthetic/fake credentials and a fake phone number before this test methodology was finalized. That check reached the real `https://graph.facebook.com` host (confirmed: this environment has outbound internet access) and received a transport-level failure back — no valid access token, template, or real phone number was ever used, so no message could have been sent, but this did constitute one unintended contact with Meta's real endpoint. All due-path testing from that point forward used only the mock-bound methodology described above, and the shipped workflow's `Call Sender` node was never executed against the real sender with real network reachability in any test counted above.
 
