@@ -1,0 +1,18 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# n8n local runtime artifacts (never commit unsanitized/local exports)
+.n8n/
+n8n-export-raw/
