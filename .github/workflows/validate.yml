@@ -18,6 +18,9 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Run validator unit tests
+        run: python3 scripts/test_validate_repository.py
+
       - name: Run repository validator
         run: python3 scripts/validate_repository.py
 
