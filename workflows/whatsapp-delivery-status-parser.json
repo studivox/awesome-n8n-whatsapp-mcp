@@ -1,0 +1,99 @@
+{
+  "id": "VOJFJ7CG3ZbkpLgy",
+  "name": "WhatsApp Delivery Status Parser",
+  "nodes": [
+    {
+      "id": "e1552644-4ae0-400f-b186-76d6aa63190e",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        250,
+        380
+      ],
+      "webhookId": "aa91ba22-728c-4304-915b-c796efb21652",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-delivery-status-parser",
+        "authentication": "none",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "3c66cf6c-497b-44fb-bbec-1f5a532d458e",
+      "name": "Scope Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        180,
+        100
+      ],
+      "parameters": {
+        "content": "## What this is -- and is not\\n\\n- Parses WhatsApp Cloud API delivery-status webhook events (sent/delivered/read/failed) into a small, safe summary. It does **not** store anything, send anything, or update a calendar/database/CRM.\\n- **POST-only.** No Meta GET verification handshake or X-Hub-Signature-256 signature validation is implemented. **Do not expose this directly to Meta without a verified gateway in front of it** -- add signature validation and the GET handshake at that gateway, or you will accept unauthenticated traffic.\\n- Processes only the **first** status event in a payload -- if Meta batches multiple status updates into one webhook call, only the first is parsed.\\n- For a 'failed' status, only the provider's numeric/string error *code* is returned -- never the raw error text or diagnostic payload, which can contain sensitive detail.\\n- Unknown/future status values (anything Meta adds later, e.g. beyond sent/delivered/read/failed) are passed through safely rather than causing an error.",
+        "height": 280,
+        "width": 540
+      }
+    },
+    {
+      "id": "d8c55e93-29ca-4792-ac28-9c3e9ce79a9b",
+      "name": "Parse Delivery Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Parse a WhatsApp Business Cloud API delivery-status webhook event.\n//\n// This node NEVER returns recipient phone numbers, message content, or the\n// raw webhook payload. It stores nothing and sends nothing -- it only\n// extracts a small, safe status summary. Only the FIRST status event in the\n// payload is processed if more than one is present (see documentation).\n\nconst item = $input.first().json;\nconst payload = item.body !== undefined ? item.body : item;\n\nfunction safeGet(obj, path, fallback) {\n  try {\n    let cur = obj;\n    for (const key of path) {\n      if (cur === null || cur === undefined) return fallback;\n      cur = cur[key];\n    }\n    return cur === undefined ? fallback : cur;\n  } catch (e) {\n    return fallback;\n  }\n}\n\nconst IGNORED = { providerMessageId: null, deliveryStatus: null, eventTimestamp: null, errorCode: null, processingStatus: 'ignored' };\n\nlet result;\n\ntry {\n  if (!payload || typeof payload !== 'object') {\n    result = IGNORED;\n  } else {\n    const entry = safeGet(payload, ['entry', 0], null);\n    const change = entry ? safeGet(entry, ['changes', 0], null) : null;\n    const value = change ? safeGet(change, ['value'], null) : null;\n\n    if (!value) {\n      result = IGNORED;\n    } else {\n      const statuses = Array.isArray(value.statuses) ? value.statuses : [];\n\n      if (statuses.length === 0) {\n        // Either a plain inbound-message event with no status, or an empty/\n        // unrecognized payload shape -- either way, nothing to parse here.\n        result = IGNORED;\n      } else {\n        // Process only the first status event; any additional entries in\n        // this payload are intentionally not processed (see documentation).\n        const first = statuses[0];\n        const providerMessageId = typeof first.id === 'string' ? first.id : null;\n\n        if (!providerMessageId) {\n          result = IGNORED;\n        } else {\n          const rawStatus = first.status;\n          // Preserve unknown/future status values safely rather than reject\n          // them -- pass through whatever string Meta sent.\n          const deliveryStatus = (typeof rawStatus === 'string' && rawStatus.length > 0) ? rawStatus : 'unknown';\n\n          const ts = first.timestamp;\n          const eventTimestamp = (typeof ts === 'string' || typeof ts === 'number') ? String(ts) : null;\n\n          let errorCode = null;\n          if (deliveryStatus === 'failed') {\n            // Only the numeric/string provider error CODE -- never the\n            // \"title\"/\"message\"/\"error_data\" fields, which can contain\n            // free-text diagnostic detail.\n            const code = safeGet(first, ['errors', 0, 'code'], null);\n            errorCode = (typeof code === 'number' || typeof code === 'string') ? code : null;\n          }\n\n          result = { providerMessageId, deliveryStatus, eventTimestamp, errorCode, processingStatus: 'parsed' };\n        }\n      }\n    }\n  }\n} catch (err) {\n  result = IGNORED;\n}\n\nreturn [{ json: result }];\n"
+      }
+    },
+    {
+      "id": "cd4bee30-ff57-421b-bea5-2e162c0d4ad0",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        800,
+        380
+      ],
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Delivery Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Delivery Status": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": []
+}

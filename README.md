@@ -17,7 +17,7 @@
 </p>
 
 > [!NOTE]
-> **Current status:** the curated resource foundation is live, and three sanitized, tested workflow packages have been published. See [Current status](#current-status) below for exactly what that does and doesn't mean.
+> **Current status:** the curated resource foundation is live, and four sanitized, tested workflow packages have been published. See [Current status](#current-status) below for exactly what that does and doesn't mean.
 
 ---
 
@@ -48,7 +48,7 @@
 | | |
 |---|---|
 | ✅ | Curated resource foundation is live: verified official documentation and repositories for n8n, WhatsApp Cloud API, Postgres, Google Calendar, MCP, and regional compliance references (VAT/BTW, e-Fatura). |
-| ✅ | Three sanitized, tested workflow packages are published — see [Available and planned workflows](#available-and-planned-workflows). None are described as production-ready or production-tested; all are verified templates with documented limitations. |
+| ✅ | Four sanitized, tested workflow packages are published — see [Available and planned workflows](#available-and-planned-workflows). None are described as production-ready or production-tested; all are verified templates with documented limitations. |
 | 🚧 | Everything else in the [planned roadmap](#available-and-planned-workflows) remains unbuilt. |
 | 📦 | Workflow submissions require a real n8n export plus matching documentation — see [Workflow package contract](#how-workflow-packages-work). |
 | 🔍 | A workflow is only listed as available after sanitization, a clean import test, and passing [automated validation](#how-validation-works). |
@@ -190,6 +190,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full sanitization checklist tha
 | WhatsApp inbound support router | [`.json`](workflows/whatsapp-inbound-support-router.json) · [`.md`](workflows/whatsapp-inbound-support-router.md) | Available — sanitized, tested, re-import verified. **Not** described as production-ready; see the workflow's own [Known limitations](workflows/whatsapp-inbound-support-router.md#known-limitations). |
 | WhatsApp appointment reply parser | [`.json`](workflows/whatsapp-appointment-reply-parser.json) · [`.md`](workflows/whatsapp-appointment-reply-parser.md) | Available — sanitized, tested, re-import verified. A **reply parser only**: classifies a customer's free-text reply, but does not update a calendar/database or send any message. **Not** described as production-ready; see the workflow's own [Known limitations](workflows/whatsapp-appointment-reply-parser.md#known-limitations). |
 | WhatsApp template message sender | [`.json`](workflows/whatsapp-template-message-sender.json) · [`.md`](workflows/whatsapp-template-message-sender.md) | Available — sanitized, tested against a local mock server (never the real Meta API), re-import verified. A **reusable sub-workflow** (Execute Workflow Trigger) that sends one approved template message and reports controlled delivery metadata. Requires your own credential and template. **Not** described as production-ready or as verified against live Meta; see the workflow's own [Known limitations](workflows/whatsapp-template-message-sender.md#known-limitations). |
+| WhatsApp delivery status parser | [`.json`](workflows/whatsapp-delivery-status-parser.json) · [`.md`](workflows/whatsapp-delivery-status-parser.md) | Available — sanitized, tested, re-import verified. A **parser only**: turns one delivery-status webhook event into a safe 5-field summary. Stores nothing, sends nothing, no end-to-end tracking system. **Not** described as production-ready; see the workflow's own [Known limitations](workflows/whatsapp-delivery-status-parser.md#known-limitations). |
 
 ### Planned roadmap
 
