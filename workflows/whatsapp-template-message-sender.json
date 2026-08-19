@@ -1,9 +1,9 @@
 {
-  "id": "1ZEjGacvbL9GoKp8",
+  "id": "R1QDUW9jYqxREyDS",
   "name": "WhatsApp Template Message Sender",
   "nodes": [
     {
-      "id": "aa712c6d-dc3d-4911-a672-a07584a49647",
+      "id": "64e0fc85-0f55-4af9-be69-cdb0ccf2baea",
       "name": "When Executed by Another Workflow",
       "type": "n8n-nodes-base.executeWorkflowTrigger",
       "typeVersion": 1.2,
@@ -30,13 +30,21 @@
             {
               "name": "bodyParameters",
               "type": "array"
+            },
+            {
+              "name": "graphApiVersion",
+              "type": "string"
+            },
+            {
+              "name": "phoneNumberId",
+              "type": "string"
             }
           ]
         }
       }
     },
     {
-      "id": "07f4412d-99b8-4c6d-b72f-559dfc9b1ba1",
+      "id": "4055f236-4b62-41d0-b8b8-92d85a9b11dc",
       "name": "Scope Notes",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
@@ -45,13 +53,13 @@
         80
       ],
       "parameters": {
-        "content": "## What this is -- and is not\\n\\n- Sends a real WhatsApp template message **only when connected to live credentials and a real Graph API URL**. Repository testing uses a local mock server, never the real Meta API.\\n- Requires a WhatsApp Business account, phone-number ID, access token, and an **already-approved** message template -- none of that is provided here.\\n- **No automatic retries** -- intentional, to avoid sending duplicate WhatsApp messages on transient failures.\\n- **No delivery-status tracking.** This only reports whether the send request was accepted, not whether the message was actually delivered/read.\\n- Never put a live access token directly in a node parameter -- always use the Header Auth credential, created manually after import.",
-        "height": 260,
+        "content": "## What this is -- and is not\\n\\n- Sends a real WhatsApp template message **only when connected to live credentials** and a real, approved WhatsApp phone-number ID. Repository testing uses a local mock server, never the real Meta API.\\n- The Graph API host is **fixed** (https://graph.facebook.com) -- not configurable via input, to prevent this workflow's outbound request being redirected elsewhere. Only the API version and your phone-number ID are inputs, both strictly validated.\\n- Requires a WhatsApp Business account, phone-number ID, access token, and an **already-approved** message template -- none of that is provided here.\\n- **No automatic retries** -- intentional, to avoid sending duplicate WhatsApp messages.\\n- **No delivery-status tracking.** This only reports whether the send request was accepted.\\n- Never put a live access token directly in a node parameter -- always use the Header Auth credential, created manually after import.\\n- Does **not** require any environment variable or instance-level configuration change -- works unmodified on n8n Cloud and default Community Edition installations.",
+        "height": 300,
         "width": 560
       }
     },
     {
-      "id": "1134e7eb-80a1-4c35-aea3-ebc4e966ec9a",
+      "id": "ef68a5b5-4ce5-41c8-9d58-520bb17e9391",
       "name": "Validate & Build Request",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -62,11 +70,11 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// Validate input for sending a WhatsApp Business Cloud API template message,\n// and build the official template-message request body when valid.\n//\n// This sub-workflow is meant to be called via the Execute Workflow node from\n// another n8n workflow (it uses an Execute Workflow Trigger, not a webhook).\n\nconst input = $input.first().json;\n\nfunction isValidPhone(v) {\n  // Plausible international, digits-only, no leading +, no leading 0.\n  return typeof v === 'string' && /^[1-9]\\d{7,14}$/.test(v);\n}\nfunction isValidTemplateName(v) {\n  // Meta template names: lowercase letters, digits, underscores only.\n  return typeof v === 'string' && v.length > 0 && v.length <= 512 && /^[a-z0-9_]+$/.test(v);\n}\nfunction isValidLanguageCode(v) {\n  // e.g. \"en\", \"en_US\", \"tr\", \"nl_NL\"\n  return typeof v === 'string' && /^[a-z]{2}(_[A-Z]{2})?$/.test(v);\n}\nfunction isValidBodyParameters(v) {\n  if (v === undefined || v === null) return true;\n  if (!Array.isArray(v)) return false;\n  if (v.length > 10) return false;\n  return v.every((p) => typeof p === 'string' && p.length > 0 && p.length <= 200);\n}\n\nconst recipientPhone = input.recipientPhone;\nconst templateName = input.templateName;\nconst languageCode = input.languageCode;\nconst bodyParameters = input.bodyParameters;\n\nconst valid =\n  isValidPhone(recipientPhone) &&\n  isValidTemplateName(templateName) &&\n  isValidLanguageCode(languageCode) &&\n  isValidBodyParameters(bodyParameters);\n\nif (!valid) {\n  return [{ json: { _route: 'invalid' } }];\n}\n\nconst components = [];\nif (Array.isArray(bodyParameters) && bodyParameters.length > 0) {\n  components.push({\n    type: 'body',\n    parameters: bodyParameters.map((text) => ({ type: 'text', text })),\n  });\n}\n\nconst requestBody = {\n  messaging_product: 'whatsapp',\n  to: recipientPhone,\n  type: 'template',\n  template: {\n    name: templateName,\n    language: { code: languageCode },\n    components,\n  },\n};\n\nreturn [{ json: { _route: 'valid', requestBody } }];\n"
+        "jsCode": "// Validate input for sending a WhatsApp Business Cloud API template message,\n// and build the official template-message request body and destination URL\n// when valid.\n//\n// This sub-workflow is meant to be called via the Execute Workflow node from\n// another n8n workflow (it uses an Execute Workflow Trigger, not a webhook).\n//\n// The Graph API host is a FIXED constant, not a workflow input -- this is\n// deliberate: accepting an arbitrary base URL as input would let a caller\n// redirect this workflow's outbound request anywhere. Only the API version\n// and your WhatsApp phone-number ID are configurable, and both are strictly\n// validated before being used to build the URL.\n\nconst input = $input.first().json;\n\nfunction isValidPhone(v) {\n  // Plausible international, digits-only, no leading +, no leading 0.\n  return typeof v === 'string' && /^[1-9]\\d{7,14}$/.test(v);\n}\nfunction isValidTemplateName(v) {\n  // Meta template names: lowercase letters, digits, underscores only.\n  return typeof v === 'string' && v.length > 0 && v.length <= 512 && /^[a-z0-9_]+$/.test(v);\n}\nfunction isValidLanguageCode(v) {\n  // e.g. \"en\", \"en_US\", \"tr\", \"nl_NL\"\n  return typeof v === 'string' && /^[a-z]{2}(_[A-Z]{2})?$/.test(v);\n}\nfunction isValidBodyParameters(v) {\n  if (v === undefined || v === null) return true;\n  if (!Array.isArray(v)) return false;\n  if (v.length > 10) return false;\n  return v.every((p) => typeof p === 'string' && p.length > 0 && p.length <= 200);\n}\nfunction isValidGraphApiVersion(v) {\n  // e.g. \"v21.0\" -- always check Meta's current supported version yourself;\n  // this only validates the FORMAT, not whether the version is still live.\n  return typeof v === 'string' && /^v\\d{1,3}\\.\\d{1,2}$/.test(v);\n}\nfunction isValidPhoneNumberId(v) {\n  // Digits only, sensible bounded length.\n  return typeof v === 'string' && /^\\d{5,20}$/.test(v);\n}\n\nconst recipientPhone = input.recipientPhone;\nconst templateName = input.templateName;\nconst languageCode = input.languageCode;\nconst bodyParameters = input.bodyParameters;\nconst graphApiVersion = input.graphApiVersion;\nconst phoneNumberId = input.phoneNumberId;\n\nconst valid =\n  isValidPhone(recipientPhone) &&\n  isValidTemplateName(templateName) &&\n  isValidLanguageCode(languageCode) &&\n  isValidBodyParameters(bodyParameters) &&\n  isValidGraphApiVersion(graphApiVersion) &&\n  isValidPhoneNumberId(phoneNumberId);\n\nif (!valid) {\n  return [{ json: { _route: 'invalid' } }];\n}\n\nconst components = [];\nif (Array.isArray(bodyParameters) && bodyParameters.length > 0) {\n  components.push({\n    type: 'body',\n    parameters: bodyParameters.map((text) => ({ type: 'text', text })),\n  });\n}\n\nconst requestBody = {\n  messaging_product: 'whatsapp',\n  to: recipientPhone,\n  type: 'template',\n  template: {\n    name: templateName,\n    language: { code: languageCode },\n    components,\n  },\n};\n\n// Fixed official production host -- never taken from input.\nconst GRAPH_BASE_URL = 'https://graph.facebook.com';\nconst url = GRAPH_BASE_URL + '/' + graphApiVersion + '/' + phoneNumberId + '/messages';\n\nreturn [{ json: { _route: 'valid', requestBody, url } }];\n"
       }
     },
     {
-      "id": "a4e6398e-e3a0-473d-bf3a-21d76443bfd5",
+      "id": "fc0303ae-56e7-40f6-8758-aba0ebb98902",
       "name": "Input Valid?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
@@ -98,7 +106,7 @@
       }
     },
     {
-      "id": "90098b16-1f68-4f49-a393-dea448ab6992",
+      "id": "95596a5f-2020-4eba-80d4-9b3d06c5363f",
       "name": "Send Template Message",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.5,
@@ -109,7 +117,7 @@
       "onError": "continueErrorOutput",
       "parameters": {
         "method": "POST",
-        "url": "={{ $env.WHATSAPP_GRAPH_BASE_URL }}/{{ $env.WHATSAPP_GRAPH_API_VERSION }}/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "url": "={{ $json.url }}",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
@@ -129,7 +137,7 @@
       }
     },
     {
-      "id": "cf9b9fbe-a007-49de-bd6a-1a94dcd68ce3",
+      "id": "0d994e79-eec2-4186-a4ae-6f51de62cce0",
       "name": "Build Response From HTTP Status",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -144,7 +152,7 @@
       }
     },
     {
-      "id": "0cc3acce-cc62-404a-a4ab-d90b9008192f",
+      "id": "175868fd-c32f-4595-8111-a06b76eb4914",
       "name": "Build Transport Failure Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -159,7 +167,7 @@
       }
     },
     {
-      "id": "09dc842d-444a-4b54-9f38-ef15ac1da728",
+      "id": "f18c5ab6-8772-4e0e-8b30-ef697502577c",
       "name": "Build Rejected Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
