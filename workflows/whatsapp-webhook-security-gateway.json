@@ -1,0 +1,409 @@
+{
+  "id": "EpU8N4H5OFqpVOKN",
+  "name": "WhatsApp Webhook Security Gateway",
+  "nodes": [
+    {
+      "id": "ccebc95e-8545-4920-acc5-fc71e23fa6d5",
+      "name": "GET Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        80,
+        40
+      ],
+      "parameters": {
+        "content": "## GET verification (Meta webhook handshake)\\n\\n- The **verify token never appears as a plain parameter** -- it lives only in the 'Verify Token' crypto credential, used as an HMAC key.\\n- Verification compares a precomputed HMAC **commitment** (HMAC of the token using itself, computed once at setup time with `scripts/generate_webhook_verify_commitment.py`) against an HMAC of the incoming token computed the same way at request time. The commitment is a one-way function of the token, but it is still deterministic -- it does not by itself protect a low-entropy token from offline guessing. Use only a token with at least 256 bits of entropy (the setup script generates one).\\n- This workflow ships with an **unconfigured placeholder** in `EXPECTED_COMMITMENT` in the 'Evaluate GET Verification' node and **fails closed**: every GET request is rejected until you replace it with your own valid 64-character lowercase hex commitment. See the documentation for exact setup steps.\\n- This workflow's settings disable execution-data persistence for this trigger (see the Settings tab), but Meta still sends `hub.verify_token` in the callback URL's query string -- your reverse proxy, load balancer, CDN, or APM tooling may log it independently of n8n. See the documentation's \\\"Infrastructure logging risk\\\" section before deploying.",
+        "height": 260,
+        "width": 520
+      }
+    },
+    {
+      "id": "da12b3fa-7552-4c7e-aa60-ddac0c240b4b",
+      "name": "GET Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        80,
+        340
+      ],
+      "webhookId": "efa1631e-951e-411e-b4c6-716604fafb3c",
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "whatsapp-webhook-gateway",
+        "authentication": "none",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "89515ded-04dd-4ded-9e0e-8b067952d7c0",
+      "name": "Hash GET Verify Token",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        340,
+        340
+      ],
+      "parameters": {
+        "action": "hmac",
+        "binaryData": false,
+        "type": "SHA256",
+        "value": "={{ $('GET Trigger').first().json.query['hub.verify_token'] || '' }}",
+        "dataPropertyName": "incomingHash",
+        "encoding": "hex"
+      }
+    },
+    {
+      "id": "e91ab22d-cd36-493a-993a-cd48a2b49958",
+      "name": "Evaluate GET Verification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        340
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Evaluate Meta's GET webhook verification handshake.\n//\n// The verify token itself is never read here -- only an HMAC \"commitment\"\n// (EXPECTED_COMMITMENT, computed once at setup time with\n// scripts/generate_webhook_verify_commitment.py) is compared against an\n// HMAC computed over the incoming hub.verify_token using the real secret\n// via the bound \"crypto\" credential (see the \"Hash GET Verify Token\" node).\n// If the incoming token matches the real secret, the two HMACs are equal;\n// if not, they differ.\n//\n// This commitment is a ONE-WAY function of the token, but it is still a\n// DETERMINISTIC function of the token: by itself it does not prove the\n// token has enough entropy to resist offline guessing of the token from\n// the commitment. Use only a cryptographically random token with at least\n// 256 bits of entropy (the setup script generates one for you). See the\n// workflow documentation's \"Security design\" section for the full\n// explanation of what this commitment does and does not protect against.\n\nfunction timingSafeEqualHex(a, b) {\n  if (typeof a !== 'string' || typeof b !== 'string') return false;\n  if (a.length !== b.length) return false;\n  let diff = 0;\n  for (let i = 0; i < a.length; i++) {\n    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);\n  }\n  return diff === 0;\n}\n\nfunction isValidCommitmentFormat(value) {\n  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);\n}\n\n// UNCONFIGURED PLACEHOLDER. Replace with the commitment printed by\n// scripts/generate_webhook_verify_commitment.py after creating your own\n// \"Verify Token\" credential -- see the documentation's setup steps. Until\n// replaced with a valid 64-character lowercase hex value, this workflow\n// FAILS CLOSED: every GET verification request is rejected, regardless of\n// the incoming hub.verify_token or hub.mode.\nconst EXPECTED_COMMITMENT = 'REPLACE_WITH_YOUR_COMMITMENT__SEE_SETUP_STEP_3';\n\nconst commitmentConfigured = isValidCommitmentFormat(EXPECTED_COMMITMENT);\n\nconst trigger = $('GET Trigger').first().json;\nconst mode = trigger.query && trigger.query['hub.mode'];\nconst challenge = trigger.query && trigger.query['hub.challenge'];\nconst computedHash = $input.first().json.incomingHash;\n\nconst modeOk = mode === 'subscribe';\nconst tokenOk = commitmentConfigured && timingSafeEqualHex(computedHash, EXPECTED_COMMITMENT);\nconst verified = commitmentConfigured && modeOk && tokenOk;\n\nreturn [{ json: { verified: verified ? 'yes' : 'no', challenge: verified && typeof challenge === 'string' ? challenge : '' } }];\n"
+      }
+    },
+    {
+      "id": "da7014d9-92ba-439a-b4c0-dd12b65bd522",
+      "name": "GET Verified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        860,
+        340
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.verified }}",
+              "rightValue": "yes",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0716b22f-ab63-40ed-a1cd-32253a84d485",
+      "name": "Respond GET Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1120,
+        240
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.challenge }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "6ccc7514-b5b3-45ac-a8c4-bdabef5515c7",
+      "name": "Respond GET Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1120,
+        440
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      }
+    },
+    {
+      "id": "9c392be1-34f1-45b2-bd65-5367ab099f44",
+      "name": "POST Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        80,
+        620
+      ],
+      "parameters": {
+        "content": "## POST signature verification\\n\\n- Requires the Webhook trigger's **Raw Body** option (already enabled) -- signatures are computed over the exact bytes Meta sent, never a re-parsed/re-serialized copy.\\n- The **app secret never appears as a plain parameter** -- it lives only in the 'App Secret' crypto credential, used as an HMAC key by the Crypto node.\\n- Comparison is constant-time (no data-dependent early exit) to reduce timing side-channel risk.\\n- Rejected requests **never reach the verified branch** -- the IF node gates it structurally.\\n- The verified branch never echoes the customer payload back in the HTTP response -- attach your downstream processing at the marked NoOp node; do not add customer data to the response.\\n- This workflow's settings disable execution-data persistence for successful, failed, and manual runs (see the Settings tab). Physical removal from n8n's database happens on n8n's normal background pruning schedule (bounded, not instantaneous -- see the documentation), not the instant a request completes.\\n- **Replay/deduplication is NOT implemented here** -- add your own if needed.\\n- This gateway does not claim protection against a compromised app secret, and does not track message history. It has been verified as a template against a specific n8n version and test suite (see the documentation) -- it is not a certified production security product.",
+        "height": 300,
+        "width": 560
+      }
+    },
+    {
+      "id": "377c5fca-4508-42ae-b422-18908a96fca4",
+      "name": "POST Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        80,
+        960
+      ],
+      "webhookId": "33f1a6b6-9ae1-49d7-81d3-8c17c5b9adc1",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-webhook-gateway",
+        "authentication": "none",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      }
+    },
+    {
+      "id": "165f078f-729c-4089-b46f-9bf40517ceaf",
+      "name": "Compute POST Body HMAC",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        340,
+        960
+      ],
+      "parameters": {
+        "action": "hmac",
+        "binaryData": true,
+        "binaryPropertyName": "data",
+        "type": "SHA256",
+        "dataPropertyName": "bodyHmac",
+        "encoding": "hex"
+      }
+    },
+    {
+      "id": "3c6180de-091c-4985-bcc2-711ebb218582",
+      "name": "Validate POST Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        960
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Validate Meta's X-Hub-Signature-256 header against an HMAC-SHA256 of the\n// EXACT raw request body (never a re-parsed/re-serialized copy -- the\n// Webhook trigger's \"Raw Body\" option preserves the original bytes exactly,\n// and the \"Compute POST Body HMAC\" node hashes that binary data directly).\n\nfunction timingSafeEqualHex(a, b) {\n  if (typeof a !== 'string' || typeof b !== 'string') return false;\n  if (a.length !== b.length) return false;\n  let diff = 0;\n  for (let i = 0; i < a.length; i++) {\n    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);\n  }\n  return diff === 0;\n}\n\nconst trigger = $('POST Trigger').first().json;\nconst headers = trigger.headers || {};\nconst signatureHeader = headers['x-hub-signature-256'];\nconst computedHex = $input.first().json.bodyHmac;\n\nlet verified = false;\nif (typeof signatureHeader === 'string' && signatureHeader.startsWith('sha256=')) {\n  const providedHex = signatureHeader.slice('sha256='.length).toLowerCase();\n  verified = timingSafeEqualHex(providedHex, computedHex);\n}\n\nreturn [{ json: { verified: verified ? 'yes' : 'no' } }];\n"
+      }
+    },
+    {
+      "id": "2a33343e-cab5-4bf2-8970-ba82b7f82cbf",
+      "name": "POST Signature Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        860,
+        960
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.verified }}",
+              "rightValue": "yes",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "236e745a-91b1-45f3-8570-0422c5cade5e",
+      "name": "VERIFIED - Attach Downstream Processing Here",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        860
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "d669a874-0b08-4afa-ba96-ec40b59bf074",
+      "name": "Respond POST Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1380,
+        860
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"status\": \"received\" } }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "4dc00acf-7de3-4f39-97e6-22e44d9ce79f",
+      "name": "Respond POST Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1120,
+        1060
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    }
+  ],
+  "connections": {
+    "GET Trigger": {
+      "main": [
+        [
+          {
+            "node": "Hash GET Verify Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash GET Verify Token": {
+      "main": [
+        [
+          {
+            "node": "Evaluate GET Verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate GET Verification": {
+      "main": [
+        [
+          {
+            "node": "GET Verified?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET Verified?": {
+      "main": [
+        [
+          {
+            "node": "Respond GET Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond GET Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST Trigger": {
+      "main": [
+        [
+          {
+            "node": "Compute POST Body HMAC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute POST Body HMAC": {
+      "main": [
+        [
+          {
+            "node": "Validate POST Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate POST Signature": {
+      "main": [
+        [
+          {
+            "node": "POST Signature Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST Signature Valid?": {
+      "main": [
+        [
+          {
+            "node": "VERIFIED - Attach Downstream Processing Here",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond POST Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VERIFIED - Attach Downstream Processing Here": {
+      "main": [
+        [
+          {
+            "node": "Respond POST Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": []
+}

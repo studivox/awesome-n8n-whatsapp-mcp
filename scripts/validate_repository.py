@@ -98,6 +98,23 @@ SVG_UNSAFE_ATTR = re.compile(
 )
 SVG_EVENT_HANDLER = re.compile(r"\son[a-zA-Z]+\s*=", re.IGNORECASE)
 
+# ---------------------------------------------------------------------------
+# Fail-closed commitment placeholder policy (see
+# workflows/whatsapp-webhook-security-gateway.md "Security design"). A
+# workflow's Code node may assign an EXPECTED_COMMITMENT constant that is
+# meant to be replaced by each user's own setup value before use. The
+# distributable copy in this repository must ship with ONLY the one
+# approved, unmistakable placeholder -- never a real-looking 64-character
+# hex commitment (which could be mistaken for configured production
+# material) and never anything else that looks like it was pasted in by
+# accident during testing.
+# ---------------------------------------------------------------------------
+APPROVED_COMMITMENT_PLACEHOLDER = "REPLACE_WITH_YOUR_COMMITMENT__SEE_SETUP_STEP_3"
+COMMITMENT_ASSIGNMENT_PATTERN = re.compile(
+    r"EXPECTED_COMMITMENT\s*=\s*['\"]([^'\"]*)['\"]"
+)
+HEX64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
 
 class Report:
     def __init__(self):
@@ -172,6 +189,43 @@ def scan_text_for_secrets(path, text, report):
 # Workflow package validation
 # ---------------------------------------------------------------------------
 
+def validate_commitment_placeholders(path, data, report):
+    nodes = data.get("nodes")
+    if not isinstance(nodes, list):
+        return
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        params = node.get("parameters")
+        js_code = params.get("jsCode") if isinstance(params, dict) else None
+        if not isinstance(js_code, str):
+            continue
+
+        for match in COMMITMENT_ASSIGNMENT_PATTERN.finditer(js_code):
+            value = match.group(1)
+            if value == APPROVED_COMMITMENT_PLACEHOLDER:
+                continue
+            node_name = node.get("name", "?")
+            if HEX64_PATTERN.match(value):
+                report.error(
+                    path,
+                    f"node {node_name!r} EXPECTED_COMMITMENT looks like a real "
+                    "64-character hex commitment, not the approved placeholder "
+                    f"({APPROVED_COMMITMENT_PLACEHOLDER!r}) -- do not commit real or "
+                    "generated setup material; the distributable workflow must ship "
+                    "with only the approved placeholder",
+                )
+            else:
+                report.error(
+                    path,
+                    f"node {node_name!r} EXPECTED_COMMITMENT is neither the approved "
+                    f"placeholder ({APPROVED_COMMITMENT_PLACEHOLDER!r}) nor empty -- "
+                    "unexpected value, verify it is not accidentally-committed setup "
+                    "material",
+                )
+
+
 def validate_workflow_json(path, report):
     try:
         text = path.read_text(encoding="utf-8")
@@ -197,6 +251,7 @@ def validate_workflow_json(path, report):
     if not isinstance(connections, dict):
         report.error(path, "workflow JSON must contain a 'connections' object")
 
+    validate_commitment_placeholders(path, data, report)
     scan_text_for_secrets(path, text, report)
 
 

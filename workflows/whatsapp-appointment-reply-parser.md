@@ -38,7 +38,7 @@ All node types are part of n8n core — no community nodes required.
 3. Adjust the keyword lists in the "Normalize, Validate & Classify Reply" node to match your business's vocabulary and language(s) (see [Known limitations](#known-limitations)).
 4. Activate the workflow. Note the generated webhook URL (path: `whatsapp-appointment-reply-parser`).
 5. **Test it with any synthetic HTTP client** (curl, Postman, etc.) sending POST requests with test payloads — see [Test procedure](#test-procedure) for real examples.
-6. **Do not point Meta's WhatsApp Cloud API webhook configuration directly at this URL.** Direct Meta integration additionally requires a separate endpoint handling Meta's `GET` verification handshake and `X-Hub-Signature-256` signature validation on every inbound POST — neither is included here.
+6. **Do not point Meta's WhatsApp Cloud API webhook configuration directly at this URL.** Direct Meta integration additionally requires a separate endpoint handling Meta's `GET` verification handshake and `X-Hub-Signature-256` signature validation on every inbound POST — see [`whatsapp-webhook-security-gateway`](whatsapp-webhook-security-gateway.md) for a verified implementation of both.
 7. Decide what happens with each `action` value in *your* system (e.g. `confirmed` → mark the booking confirmed in your calendar tool; `manual_review` → alert a human) — this workflow deliberately stops at reporting the parsed result.
 
 ## Test procedure
@@ -67,7 +67,7 @@ All test payloads used only synthetic values: fake phone numbers (`YOUR_TEST_PHO
 
 ## Known limitations
 
-- **No webhook authenticity/signature verification, and no Meta GET handshake.** This workflow is POST-only. **Do not point Meta's webhook configuration directly at this URL as-is** — build and test a separate GET-verification endpoint and POST signature validation first.
+- **No webhook authenticity/signature verification, and no Meta GET handshake.** This workflow is POST-only. **Do not point Meta's webhook configuration directly at this URL as-is** — see [`whatsapp-webhook-security-gateway`](whatsapp-webhook-security-gateway.md) for a verified GET-verification and POST-signature-validation implementation.
 - **Classification is deterministic word/phrase matching, not AI/ML.** It recognizes a fixed list of English words/phrases with word-boundary-aware matching (so "yes" won't match inside "yesterday"), but it doesn't understand meaning, sarcasm, other languages, or nuanced replies. Businesses must adapt the keyword lists (and add other languages) before relying on this.
 - **Conflicting signals always route to `manual_review`.** A reply matching more than one category (e.g. "I won't cancel, I confirm") is deliberately never guessed at — this favors safety over decisiveness.
 - **This workflow takes no action beyond classification.** It does not update a calendar, does not update a database, and does not send any WhatsApp message — including no confirmation of receipt back to the customer. All of that is left for the business to build on top of the `action` value this returns.

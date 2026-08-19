@@ -50,7 +50,7 @@ Every value taken from the inbound payload's first status event is bounded and f
 2. Open the workflow and review the Code node and the Sticky Note's warnings.
 3. Activate the workflow. Note the generated webhook URL (path: `whatsapp-delivery-status-parser`).
 4. **Test it with any synthetic HTTP client** (curl, Postman, etc.) sending POST requests with test payloads — see [Test procedure](#test-procedure) for real examples.
-5. **Do not expose this workflow's URL directly to Meta without a verified gateway in front of it.** This workflow implements no GET verification handshake and no `X-Hub-Signature-256` signature validation — put a gateway that handles both in front of it before pointing any real Meta webhook subscription here.
+5. **Do not expose this workflow's URL directly to Meta without a verified gateway in front of it.** This workflow implements no GET verification handshake and no `X-Hub-Signature-256` signature validation — see [`whatsapp-webhook-security-gateway`](whatsapp-webhook-security-gateway.md) for a verified implementation of both, and put it in front of this workflow before pointing any real Meta webhook subscription here.
 6. Decide what happens with each `deliveryStatus`/`processingStatus` value in *your* system — this workflow deliberately stops at reporting the parsed result; it stores and sends nothing itself.
 
 ## Test procedure
@@ -91,7 +91,7 @@ All test payloads used only synthetic values: fake WhatsApp message IDs (`wamid.
 
 ## Known limitations
 
-- **No webhook authenticity/signature verification, and no Meta GET handshake.** This workflow is POST-only and trusts whatever is sent to it. **Do not expose it directly to Meta without a verified gateway in front of it** that handles the GET verification handshake and `X-Hub-Signature-256` validation — without that, anyone who finds the URL can send it arbitrary payloads.
+- **No webhook authenticity/signature verification, and no Meta GET handshake.** This workflow is POST-only and trusts whatever is sent to it. **Do not expose it directly to Meta without a verified gateway in front of it** — see [`whatsapp-webhook-security-gateway`](whatsapp-webhook-security-gateway.md) for a verified GET-handshake and `X-Hub-Signature-256` implementation — without that, anyone who finds the URL can send it arbitrary payloads.
 - **Only the first status event in a payload is processed.** If Meta batches multiple status updates into a single webhook call, every entry after the first is silently not processed by this workflow. A production system needs to either configure Meta/its gateway to avoid batching, or extend this workflow to loop over all entries.
 - **No end-to-end delivery tracking.** This workflow does not persist status history, does not correlate a `failed` event back to the original send request, and does not retry or alert on anything — it is a single-event parser, not a tracking system.
 - **Unknown status values are passed through only if they look like a safe token** (see [Validation rules](#validation-rules)) — so a future Meta status addition doesn't break this workflow, but a caller relying on `deliveryStatus` should not assume it is always one of `sent`/`delivered`/`read`/`failed`; it could also be another lowercase-token value, or the literal string `"unknown"`.
