@@ -122,12 +122,6 @@ Invoicing and tax rules are inherently local. This project's workflows are built
 | [modelcontextprotocol/typescript-sdk](https://github.com/modelcontextprotocol/typescript-sdk) | Official TypeScript SDK for building an MCP server. |
 | [MCP quickstart — build a server](https://modelcontextprotocol.io/quickstart/server) | Official step-by-step guide to writing an MCP server from scratch. |
 
-### Claude Code Skills
-
-| Resource | Description |
-|---|---|
-| [ComposioHQ/awesome-claude-skills](https://github.com/ComposioHQ/awesome-claude-skills) | A large curated collection of Claude Code skills and plugins. |
-
 None of the above are personally claimed as "tested in production" here — they are official references and primary sources. Where a resource has actually been run and verified by a contributor, that's stated explicitly in its entry.
 
 ## How workflow packages work
