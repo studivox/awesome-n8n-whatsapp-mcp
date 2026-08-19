@@ -17,7 +17,7 @@
 </p>
 
 > [!NOTE]
-> **Current status:** the curated resource foundation is live, and five sanitized, tested workflow packages have been published. See [Current status](#current-status) below for exactly what that does and doesn't mean.
+> **Current status:** the curated resource foundation is live, and six sanitized, tested workflow packages have been published. See [Current status](#current-status) below for exactly what that does and doesn't mean.
 
 ---
 
@@ -48,7 +48,7 @@
 | | |
 |---|---|
 | ✅ | Curated resource foundation is live: verified official documentation and repositories for n8n, WhatsApp Cloud API, Postgres, Google Calendar, MCP, and regional compliance references (VAT/BTW, e-Fatura). |
-| ✅ | Five sanitized, tested workflow packages are published — see [Available and planned workflows](#available-and-planned-workflows). None are described as production-ready or production-tested; all are verified templates with documented limitations. |
+| ✅ | Six sanitized, tested workflow packages are published — see [Available and planned workflows](#available-and-planned-workflows). None are described as production-ready or production-tested; all are verified templates with documented limitations. |
 | 🚧 | Everything else in the [planned roadmap](#available-and-planned-workflows) remains unbuilt. |
 | 📦 | Workflow submissions require a real n8n export plus matching documentation — see [Workflow package contract](#how-workflow-packages-work). |
 | 🔍 | A workflow is only listed as available after sanitization, a clean import test, and passing [automated validation](#how-validation-works). |
@@ -192,6 +192,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full sanitization checklist tha
 | WhatsApp template message sender | [`.json`](workflows/whatsapp-template-message-sender.json) · [`.md`](workflows/whatsapp-template-message-sender.md) | Available — sanitized, tested against a local mock server (never the real Meta API), re-import verified. A **reusable sub-workflow** (Execute Workflow Trigger) that sends one approved template message and reports controlled delivery metadata. Requires your own credential and template. **Not** described as production-ready or as verified against live Meta; see the workflow's own [Known limitations](workflows/whatsapp-template-message-sender.md#known-limitations). |
 | WhatsApp delivery status parser | [`.json`](workflows/whatsapp-delivery-status-parser.json) · [`.md`](workflows/whatsapp-delivery-status-parser.md) | Available — sanitized, tested, re-import verified. A **parser only**: turns one delivery-status webhook event into a safe 5-field summary. Stores nothing, sends nothing, no end-to-end tracking system. **Not** described as production-ready; see the workflow's own [Known limitations](workflows/whatsapp-delivery-status-parser.md#known-limitations). |
 | WhatsApp webhook security gateway | [`.json`](workflows/whatsapp-webhook-security-gateway.json) · [`.md`](workflows/whatsapp-webhook-security-gateway.md) | Available — sanitized, 26-test suite, re-import verified. Verifies Meta's GET handshake and POST `X-Hub-Signature-256` signature over the exact raw body before anything downstream runs. Both secrets live only in n8n Crypto credentials, absent from the exported JSON. Execution-data persistence disabled by workflow settings (physical deletion bounded, not instant — verified experimentally); ships with a placeholder commitment that fails closed until replaced. **Not** a claim of replay protection, downstream persistence, or control over upstream infrastructure logging; see the workflow's own [Known limitations](workflows/whatsapp-webhook-security-gateway.md#known-limitations). |
+| WhatsApp appointment reminder | [`.json`](workflows/whatsapp-appointment-reminder.json) · [`.md`](workflows/whatsapp-appointment-reminder.md) | Available — sanitized, 25-scenario test suite, re-import verified on a second clean instance. A **reusable sub-workflow** (Execute Workflow Trigger) that decides whether a reminder is due (`not_due`/`due`/`expired`/`rejected`) and, only when due, calls the "WhatsApp template message sender" by its committed workflow id rather than duplicating its HTTP/template logic. Execution-data persistence disabled by workflow settings (physical deletion bounded, not instant — verified experimentally). **No idempotency protection** — calling it twice for the same due appointment sends twice, demonstrated by test, not just asserted. **Not** a scheduler, calendar, or database integration; **not** described as production-ready; see the workflow's own [Known limitations](workflows/whatsapp-appointment-reminder.md#known-limitations). |
 
 ### Planned roadmap
 
@@ -199,7 +200,6 @@ These are **planned, not available** — no `.json` file exists for any of them 
 
 | Workflow | Status |
 |---|---|
-| WhatsApp appointment reminder | Planned — not available yet |
 | WhatsApp appointment confirmation and cancellation | Planned — not available yet |
 | Google Calendar ↔ Postgres synchronization | Planned — not available yet |
 | Unpaid invoice reminder | Planned — not available yet |
