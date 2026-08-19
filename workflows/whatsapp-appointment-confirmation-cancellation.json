@@ -48,9 +48,9 @@
         -960
       ],
       "parameters": {
-        "content": "## WhatsApp Appointment Confirmation and Cancellation\\n\\n- **Consumes** the already-classified `action` from whatsapp-appointment-reply-parser.json.\\n- **calendarEventId is NOT a caller input.** It is read exclusively from Postgres (appointments.calendar_event_id) -- arbitrary caller data can never redirect the Calendar request to a different event.\\n- **Idempotency reservation and the appointment compare-and-set happen in ONE atomic Postgres statement.** No crash point can leave a stranded generic \\\"processing\\\" row -- the only durable intermediate state is the deliberate, explicit `calendar_sync_pending`, recorded atomically alongside the appointment mutation itself.\\n- **calendar_sync_pending blocks overlapping actions** on the same appointment (`calendar_busy`) until the pending Calendar call resolves -- a human or a separate reconciliation workflow must resolve a stuck pending/failed state; see the documentation.\\n- **Final Calendar-result writes are version-guarded** (WHERE version = the version produced by the original update) -- a slow execution can never overwrite calendar_sync_status after a newer action has already committed; such cases are marked `reconciliation_required`, never false success.\\n- **No automatic retries anywhere in this workflow.**",
-        "height": 460,
-        "width": 620
+        "content": "## WhatsApp Appointment Confirmation and Cancellation\\n\\n- **Consumes** the already-classified `action` from whatsapp-appointment-reply-parser.json.\\n- **calendarEventId is NOT a caller input.** It is read exclusively from Postgres (appointments.calendar_event_id) -- arbitrary caller data can never redirect the Calendar request to a different event.\\n- **The process_reply_event(...) PL/pgSQL function is the SOLE gate for owning a replyEventId reservation** -- a caller that loses that race can never mutate ANY appointment, including a different one than the winner's. This fixes a real cross-appointment race present in an earlier same-snapshot-CTE design; see the documentation.\\n- **calendar_sync_pending blocks overlapping actions** on the same appointment (`calendar_busy`) until the pending Calendar call resolves -- a human or a separate reconciliation workflow must resolve a stuck pending/failed state; see the documentation.\\n- **Final Calendar-result writes are version-guarded** (WHERE version = the version produced by the original update) -- a slow execution can never overwrite calendar_sync_status after a newer action has already committed; such cases are marked `reconciliation_required`, never false success.\\n- **No automatic retries anywhere in this workflow.**",
+        "height": 480,
+        "width": 640
       }
     },
     {
@@ -126,7 +126,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH appt_check AS (\n  SELECT appointment_id, version, calendar_event_id, calendar_sync_status\n  FROM appointments\n  WHERE appointment_id = $2\n),\nupdated AS (\n  UPDATE appointments\n  SET status = $3,\n      version = version + 1,\n      calendar_sync_status = CASE\n        WHEN $3 IN ('confirmed','cancelled') THEN 'calendar_sync_pending'\n        ELSE 'not_applicable'\n      END,\n      updated_at = now()\n  WHERE appointment_id = $2\n    AND version = $5\n    AND calendar_sync_status <> 'calendar_sync_pending'\n    AND NOT EXISTS (SELECT 1 FROM reply_events WHERE reply_event_id = $1)\n  RETURNING appointment_id, calendar_event_id, version, status, calendar_sync_status\n),\nreserve AS (\n  INSERT INTO reply_events (reply_event_id, appointment_id, action, action_timestamp, result_status)\n  SELECT $1, $2, $3, $4::timestamptz,\n    CASE\n      WHEN EXISTS (SELECT 1 FROM updated) THEN\n        CASE WHEN $3 IN ('confirmed','cancelled') THEN 'calendar_sync_pending' ELSE $3 END\n      WHEN NOT EXISTS (SELECT 1 FROM appt_check) THEN 'missing_appointment'\n      WHEN (SELECT calendar_sync_status FROM appt_check) = 'calendar_sync_pending'\n           AND (SELECT version FROM appt_check) = $5 THEN 'calendar_busy'\n      ELSE 'conflict'\n    END\n  WHERE NOT EXISTS (SELECT 1 FROM reply_events WHERE reply_event_id = $1)\n  ON CONFLICT (reply_event_id) DO NOTHING\n  RETURNING reply_event_id, result_status\n)\nSELECT\n  (SELECT count(*) FROM reserve)::int AS reserved_count,\n  (SELECT result_status FROM reserve) AS new_result_status,\n  (SELECT result_status FROM reply_events WHERE reply_event_id = $1) AS existing_result_status,\n  (SELECT calendar_event_id FROM updated) AS calendar_event_id,\n  (SELECT version FROM updated) AS new_version;\n",
+        "query": "SELECT route, result_status, out_calendar_event_id, out_new_version\nFROM process_reply_event($1, $2, $3, $4::timestamptz, $5);\n",
         "options": {
           "queryReplacement": "={{ [$json.replyEventId, $json.appointmentId, $json.action, $json.actionTimestamp, $json.expectedVersion] }}"
         }
@@ -144,54 +144,7 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// Classifies the single atomic reserve-and-apply statement's result.\n//\n// reserved_count = 0 means this replyEventId was already recorded by a\n// PRIOR statement -- a genuine duplicate (or a retry after a crash that\n// happened AFTER the atomic write committed, which is exactly why that\n// write must be atomic: there is no ambiguous half-done state to land in\n// between). The existing, already-durable result_status is returned\n// as-is -- never a generic \"duplicate\" label -- so a pending, failed, or\n// completed prior outcome is distinguishable.\n\nconst result = $input.first().json;\nconst validated = $('Validate Input').first().json;\n\nconst isDuplicate = result.reserved_count === 0;\nconst resultStatus = isDuplicate ? result.existing_result_status : result.new_result_status;\n\nlet route;\nif (isDuplicate) {\n  route = 'duplicate';\n} else if (resultStatus === 'calendar_sync_pending') {\n  route = 'needs_calendar';\n} else {\n  // missing_appointment | conflict | calendar_busy | reschedule_requested | manual_review\n  route = 'finalized';\n}\n\nconst calendarEventId = (result.calendar_event_id !== undefined && result.calendar_event_id !== null && result.calendar_event_id !== '')\n  ? result.calendar_event_id\n  : null;\n\nreturn [{ json: {\n  _route: route,\n  resultStatus,\n  replyEventId: validated.replyEventId,\n  appointmentId: validated.appointmentId,\n  action: validated.action,\n  calendarEventId,\n  hasCalendarEventId: calendarEventId !== null,\n  newVersion: result.new_version !== undefined ? result.new_version : null,\n} }];\n"
-      }
-    },
-    {
-      "id": "ifDuplicate",
-      "name": "Is Duplicate?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.3,
-      "position": [
-        1300,
-        -160
-      ],
-      "parameters": {
-        "conditions": {
-          "combinator": "and",
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "leftValue": "={{ $json._route }}",
-              "rightValue": "duplicate",
-              "operator": {
-                "type": "string",
-                "operation": "equals"
-              }
-            }
-          ]
-        },
-        "options": {}
-      }
-    },
-    {
-      "id": "buildStatusFromDuplicate",
-      "name": "Build Status Response (Duplicate)",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1560,
-        140
-      ],
-      "parameters": {
-        "mode": "runOnceForAllItems",
-        "language": "javaScript",
-        "jsCode": "// Reached for: duplicate replays, missing_appointment, conflict,\n// calendar_busy, reschedule_requested, and manual_review. None of these\n// paths reach the calendar HTTP node -- structurally guaranteed by the\n// IF node that routes here.\n\nconst classified = $('Classify Reserve Result').first().json;\n\nreturn [{ json: {\n  status: classified.resultStatus,\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  version: classified.newVersion,\n  httpStatus: null,\n} }];\n"
+        "jsCode": "// Classifies process_reply_event(...)'s result. `route` is one of:\n//   'owner_applied'       -- this call owns the replyEventId reservation;\n//                            result_status is the actual outcome (which\n//                            may itself be a terminal status, or\n//                            'calendar_sync_pending' if a Calendar call is\n//                            still needed).\n//   'duplicate_match'     -- replyEventId already reserved by an IDENTICAL\n//                            prior request (same appointmentId/action/\n//                            actionTimestamp) -- result_status is that\n//                            prior request's real, durable outcome.\n//   'idempotency_mismatch'-- replyEventId already reserved by a DIFFERENT\n//                            request (different appointmentId, action, or\n//                            actionTimestamp) -- zero mutation of any\n//                            appointment occurred for this call, and the\n//                            existing reservation's result is never\n//                            returned as though it belonged to this one.\n//\n// Every one of these routes except \"owner_applied with\n// calendar_sync_pending\" is immediately terminal -- no Calendar call is\n// ever reachable from this node except via that one specific path.\n\nconst result = $input.first().json;\nconst validated = $('Validate Input').first().json;\n\nconst needsCalendar = result.route === 'owner_applied' && result.result_status === 'calendar_sync_pending';\n\nconst calendarEventId = (result.out_calendar_event_id !== undefined && result.out_calendar_event_id !== null && result.out_calendar_event_id !== '')\n  ? result.out_calendar_event_id\n  : null;\n\nreturn [{ json: {\n  _route: needsCalendar ? 'needs_calendar' : 'finalized',\n  resultStatus: result.result_status,\n  replyEventId: validated.replyEventId,\n  appointmentId: validated.appointmentId,\n  action: validated.action,\n  calendarEventId,\n  hasCalendarEventId: calendarEventId !== null,\n  newVersion: result.out_new_version !== undefined ? result.out_new_version : null,\n} }];\n"
       }
     },
     {
@@ -200,7 +153,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        1560,
+        1300,
         -320
       ],
       "parameters": {
@@ -227,18 +180,18 @@
       }
     },
     {
-      "id": "buildStatusFromFinalized",
-      "name": "Build Status Response (Finalized)",
+      "id": "buildStatusResponse",
+      "name": "Build Status Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1820,
-        -100
+        1560,
+        -60
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// Reached for: duplicate replays, missing_appointment, conflict,\n// calendar_busy, reschedule_requested, and manual_review. None of these\n// paths reach the calendar HTTP node -- structurally guaranteed by the\n// IF node that routes here.\n\nconst classified = $('Classify Reserve Result').first().json;\n\nreturn [{ json: {\n  status: classified.resultStatus,\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  version: classified.newVersion,\n  httpStatus: null,\n} }];\n"
+        "jsCode": "// Reached for every outcome that does not require a Calendar call:\n// duplicate_match, idempotency_mismatch, missing_appointment, conflict,\n// calendar_busy, reschedule_requested, and manual_review alike. None of\n// these paths reach the calendar HTTP node -- structurally guaranteed by\n// the \"Needs Calendar Action?\" IF node that routes here only on its false\n// output.\n\nconst classified = $('Classify Reserve Result').first().json;\n\nreturn [{ json: {\n  status: classified.resultStatus,\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  version: classified.newVersion,\n  httpStatus: null,\n} }];\n"
       }
     },
     {
@@ -247,7 +200,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        1820,
+        1560,
         -620
       ],
       "parameters": {
@@ -279,7 +232,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2080,
+        1820,
         -420
       ],
       "parameters": {
@@ -294,13 +247,13 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2080,
+        1820,
         -700
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// Builds the Google Calendar API request for confirmed/cancelled actions\n// only -- reached only after the appointment's own database state was\n// already durably updated (calendar_sync_pending) by the atomic\n// reserve-and-apply statement, AND only after confirming a\n// calendarEventId is present. The calendar event id comes EXCLUSIVELY\n// from Postgres (appointments.calendar_event_id, read back from the\n// atomic write) -- it is never taken from caller input, so arbitrary\n// caller-supplied data cannot redirect this request to a different\n// calendar event. The host is likewise a FIXED constant, like the Meta\n// Graph API host in whatsapp-template-message-sender.json.\n\nconst classified = $('Classify Reserve Result').first().json;\n\nconst CALENDAR_BASE_URL = 'https://www.googleapis.com';\nconst calendarId = 'primary';\nconst eventId = classified.calendarEventId;\n\nlet body;\nif (classified.action === 'confirmed') {\n  // Restores an event previously cancelled -- status must be set back to\n  // \"confirmed\" explicitly, not just the private metadata flag, or a\n  // confirmed-after-cancelled transition would leave the event looking\n  // cancelled on the calendar despite the customer confirming.\n  body = { status: 'confirmed', extendedProperties: { private: { confirmationStatus: 'confirmed' } } };\n} else {\n  // cancelled -- Google's documented way to cancel an event via the API\n  // is to PATCH its status to \"cancelled\" (not DELETE, which would remove\n  // all history/auditability of the event ever having existed).\n  body = { status: 'cancelled' };\n}\n\nlet url = CALENDAR_BASE_URL + '/calendar/v3/calendars/' + encodeURIComponent(calendarId) + '/events/' + encodeURIComponent(eventId);\n\nreturn [{ json: {\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  action: classified.action,\n  newVersion: classified.newVersion,\n  url,\n  requestBody: body,\n} }];\n"
+        "jsCode": "// Builds the Google Calendar API request for confirmed/cancelled actions\n// only -- reached only after the appointment's own database state was\n// already durably updated (calendar_sync_pending) by process_reply_event,\n// AND only after confirming a calendarEventId is present. The calendar\n// event id comes EXCLUSIVELY from Postgres (appointments.calendar_event_id,\n// read back from the atomic write) -- it is never taken from caller\n// input, so arbitrary caller-supplied data cannot redirect this request\n// to a different calendar event. The host is likewise a FIXED constant,\n// like the Meta Graph API host in whatsapp-template-message-sender.json.\n\nconst classified = $('Classify Reserve Result').first().json;\n\nconst CALENDAR_BASE_URL = 'https://www.googleapis.com';\nconst calendarId = 'primary';\nconst eventId = classified.calendarEventId;\n\nlet body;\nif (classified.action === 'confirmed') {\n  // Restores an event previously cancelled -- status must be set back to\n  // \"confirmed\" explicitly, not just the private metadata flag, or a\n  // confirmed-after-cancelled transition would leave the event looking\n  // cancelled on the calendar despite the customer confirming.\n  body = { status: 'confirmed', extendedProperties: { private: { confirmationStatus: 'confirmed' } } };\n} else {\n  // cancelled -- Google's documented way to cancel an event via the API\n  // is to PATCH its status to \"cancelled\" (not DELETE, which would remove\n  // all history/auditability of the event ever having existed).\n  body = { status: 'cancelled' };\n}\n\nlet url = CALENDAR_BASE_URL + '/calendar/v3/calendars/' + encodeURIComponent(calendarId) + '/events/' + encodeURIComponent(eventId);\n\nreturn [{ json: {\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  action: classified.action,\n  newVersion: classified.newVersion,\n  url,\n  requestBody: body,\n} }];\n"
       }
     },
     {
@@ -500,24 +453,6 @@
       "main": [
         [
           {
-            "node": "Is Duplicate?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Is Duplicate?": {
-      "main": [
-        [
-          {
-            "node": "Build Status Response (Duplicate)",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
             "node": "Needs Calendar Action?",
             "type": "main",
             "index": 0
@@ -536,7 +471,7 @@
         ],
         [
           {
-            "node": "Build Status Response (Finalized)",
+            "node": "Build Status Response",
             "type": "main",
             "index": 0
           }
@@ -675,5 +610,5 @@
   "staticData": null,
   "meta": null,
   "tags": [],
-  "id": "IxlyBxqQTEJkNcq9"
+  "id": "utdMPd899iFS8nuJ"
 }
