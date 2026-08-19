@@ -1,0 +1,308 @@
+{
+  "id": "x18BpKjoBs3GqALv",
+  "name": "WhatsApp Appointment Reminder",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "appointmentId",
+              "type": "string"
+            },
+            {
+              "name": "recipient",
+              "type": "string"
+            },
+            {
+              "name": "appointmentStart",
+              "type": "string"
+            },
+            {
+              "name": "reminderLeadMinutes",
+              "type": "number"
+            },
+            {
+              "name": "sendWindowMinutes",
+              "type": "number"
+            },
+            {
+              "name": "graphApiVersion",
+              "type": "string"
+            },
+            {
+              "name": "phoneNumberId",
+              "type": "string"
+            },
+            {
+              "name": "templateName",
+              "type": "string"
+            },
+            {
+              "name": "languageCode",
+              "type": "string"
+            },
+            {
+              "name": "bodyParameters",
+              "type": "array"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "scopeNote",
+      "name": "Scope Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -260
+      ],
+      "parameters": {
+        "content": "## WhatsApp Appointment Reminder\\n\\n- **Building block, not a scheduler.** Something else (a Cron/Schedule Trigger elsewhere, or your own polling job) must call this sub-workflow once per candidate appointment -- it does not read a calendar or database itself and has no trigger of its own beyond Execute Workflow.\\n- **No idempotency protection.** This workflow is stateless: invoking it twice with the same due appointment sends the reminder twice. The caller must track which appointments already got a reminder.\\n- **No calendar/database read or write of any kind.** All appointment data arrives as input parameters.",
+        "height": 300,
+        "width": 480
+      }
+    },
+    {
+      "id": "validate",
+      "name": "Validate & Classify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Validates a reminder request and classifies it as rejected / not_due /\n// due / expired, using the REAL execution-time clock. This node does NOT\n// call the WhatsApp Template Message Sender sub-workflow and does NOT build\n// any Meta API request itself -- see the \"Call Sender\" Execute Workflow\n// node for that (workflows/whatsapp-template-message-sender.json).\n//\n// Validation for the sender-bound fields (templateName, languageCode,\n// graphApiVersion, phoneNumberId, bodyParameters) deliberately mirrors the\n// sender's OWN validation rules, so input the sender would reject is\n// rejected HERE too, before any sub-workflow call is made. This is\n// intentional pre-validation duplication, not a reimplementation of the\n// sender's HTTP request or template-body construction logic -- that logic\n// exists only in the sender sub-workflow.\n//\n// Validation runs unconditionally, before any timing check: an appointment\n// with an invalid template name is \"rejected\", never \"not_due\" or\n// \"expired\", regardless of its timestamp.\n\nconst input = $input.first().json;\n\nfunction isValidAppointmentId(v) {\n  // Opaque bounded identifier -- letters, digits, hyphen, underscore only.\n  return typeof v === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(v);\n}\nfunction isValidRecipient(v) {\n  // Exact same shape the sender validates as `recipientPhone`.\n  return typeof v === 'string' && /^[1-9]\\d{7,14}$/.test(v);\n}\nfunction isValidAppointmentStart(v) {\n  // ISO-8601 with an EXPLICIT UTC offset or \"Z\". A bare local timestamp\n  // (no offset) is deliberately rejected -- this workflow never guesses a\n  // customer's timezone.\n  //\n  // Regex alone (or Date.parse alone) is not enough: JavaScript's Date\n  // silently NORMALIZES impossible calendar dates instead of rejecting\n  // them (e.g. \"2026-02-30\" rolls over into March). Every component is\n  // therefore validated by hand, strictly, before any Date.parse call.\n  if (typeof v !== 'string') return false;\n  const match = /^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.\\d{1,3})?(Z|[+-]\\d{2}:\\d{2})$/.exec(v);\n  if (!match) return false;\n\n  const year = Number(match[1]);\n  const month = Number(match[2]);\n  const day = Number(match[3]);\n  const hour = Number(match[4]);\n  const minute = Number(match[5]);\n  const second = Number(match[6]);\n  const offset = match[7];\n\n  if (month < 1 || month > 12) return false;\n\n  const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;\n  const daysInMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];\n  if (day < 1 || day > daysInMonth[month - 1]) return false;\n\n  if (hour > 23) return false;\n  if (minute > 59) return false;\n  if (second > 59) return false;\n\n  if (offset !== 'Z') {\n    const offsetMatch = /^([+-])(\\d{2}):(\\d{2})$/.exec(offset);\n    const offsetSign = offsetMatch[1];\n    const offsetHour = Number(offsetMatch[2]);\n    const offsetMinute = Number(offsetMatch[3]);\n\n    // Real-world UTC offsets range from -12:00 to +14:00 -- reject\n    // anything outside that practical ISO-8601 range. The one +14 offset\n    // actually in use (Kiribati's Line Islands) is exactly +14:00, so a\n    // \"+14:xx\" with nonzero minutes is impossible and rejected too.\n    if (offsetHour > 14) return false;\n    if (offsetMinute > 59) return false;\n    if (offsetSign === '+' && offsetHour === 14 && offsetMinute !== 0) return false;\n    if (offsetSign === '-' && offsetHour > 12) return false;\n  }\n\n  // Defense-in-depth: every component has already been validated strictly\n  // above, so this should always succeed for a well-formed date at this\n  // point -- kept as a final guard, not relied on for date validity.\n  return Number.isFinite(Date.parse(v));\n}\nfunction isValidBoundedMinutes(v, max) {\n  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= max;\n}\nfunction isValidTemplateName(v) {\n  return typeof v === 'string' && v.length > 0 && v.length <= 512 && /^[a-z0-9_]+$/.test(v);\n}\nfunction isValidLanguageCode(v) {\n  return typeof v === 'string' && /^[a-z]{2}(_[A-Z]{2})?$/.test(v);\n}\nfunction isValidBodyParameters(v) {\n  if (v === undefined || v === null) return true;\n  if (!Array.isArray(v)) return false;\n  if (v.length > 10) return false;\n  return v.every((p) => typeof p === 'string' && p.length > 0 && p.length <= 200);\n}\nfunction isValidGraphApiVersion(v) {\n  return typeof v === 'string' && /^v\\d{1,3}\\.\\d{1,2}$/.test(v);\n}\nfunction isValidPhoneNumberId(v) {\n  return typeof v === 'string' && /^\\d{5,20}$/.test(v);\n}\n\nconst MAX_LEAD_MINUTES = 10080; // 7 days\nconst MAX_WINDOW_MINUTES = 1440; // 24 hours\n\nconst appointmentId = input.appointmentId;\nconst recipient = input.recipient;\nconst appointmentStart = input.appointmentStart;\nconst reminderLeadMinutes = input.reminderLeadMinutes;\nconst sendWindowMinutes = input.sendWindowMinutes;\nconst graphApiVersion = input.graphApiVersion;\nconst phoneNumberId = input.phoneNumberId;\nconst templateName = input.templateName;\nconst languageCode = input.languageCode;\nconst bodyParameters = input.bodyParameters;\n\nconst appointmentIdValid = isValidAppointmentId(appointmentId);\n\nconst valid =\n  appointmentIdValid &&\n  isValidRecipient(recipient) &&\n  isValidAppointmentStart(appointmentStart) &&\n  isValidBoundedMinutes(reminderLeadMinutes, MAX_LEAD_MINUTES) &&\n  isValidBoundedMinutes(sendWindowMinutes, MAX_WINDOW_MINUTES) &&\n  isValidGraphApiVersion(graphApiVersion) &&\n  isValidPhoneNumberId(phoneNumberId) &&\n  isValidTemplateName(templateName) &&\n  isValidLanguageCode(languageCode) &&\n  isValidBodyParameters(bodyParameters);\n\nif (!valid) {\n  // Only ever echo appointmentId back if it ITSELF passed full validation --\n  // never an oversized, invalid-character, or otherwise attacker-controlled\n  // string, even if some OTHER field is what caused the rejection. An\n  // invalid identifier is never truncated and returned partially -- it\n  // becomes null, full stop.\n  return [{ json: {\n    _route: 'rejected',\n    appointmentId: appointmentIdValid ? appointmentId : null,\n    dispatchAt: null,\n  } }];\n}\n\nconst appointmentStartMs = Date.parse(appointmentStart);\nconst dispatchAtMs = appointmentStartMs - reminderLeadMinutes * 60000;\nconst windowEndMs = dispatchAtMs + sendWindowMinutes * 60000;\nconst dispatchAt = new Date(dispatchAtMs).toISOString();\n\n// Real execution-time clock only -- there is no input field a caller can\n// use to override \"now\". Tests generate synthetic appointmentStart values\n// relative to the actual test-run time instead of injecting a fake clock.\nconst nowMs = Date.now();\n\nlet route;\nif (nowMs < dispatchAtMs) {\n  route = 'not_due';\n} else if (nowMs <= windowEndMs) {\n  // Inclusive on both ends by design: nowMs === dispatchAtMs and\n  // nowMs === windowEndMs both count as \"due\". This is the documented,\n  // deterministic boundary rule -- see the workflow's documentation.\n  route = 'due';\n} else {\n  route = 'expired';\n}\n\nreturn [{ json: {\n  _route: route,\n  appointmentId,\n  dispatchAt,\n  recipient,\n  templateName,\n  languageCode,\n  graphApiVersion,\n  phoneNumberId,\n  bodyParameters: bodyParameters === undefined ? [] : bodyParameters,\n} }];\n"
+      }
+    },
+    {
+      "id": "dueIf",
+      "name": "Due Now?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "due",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "callSender",
+      "name": "Call Sender",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        780,
+        -120
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "mode": "id",
+          "value": "R1QDUW9jYqxREyDS",
+          "cachedResultName": "WhatsApp Template Message Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "recipientPhone": "={{ $json.recipient }}",
+            "templateName": "={{ $json.templateName }}",
+            "languageCode": "={{ $json.languageCode }}",
+            "graphApiVersion": "={{ $json.graphApiVersion }}",
+            "phoneNumberId": "={{ $json.phoneNumberId }}",
+            "bodyParameters": "={{ $json.bodyParameters }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "recipientPhone",
+              "displayName": "recipientPhone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "templateName",
+              "displayName": "templateName",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "languageCode",
+              "displayName": "languageCode",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "graphApiVersion",
+              "displayName": "graphApiVersion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "phoneNumberId",
+              "displayName": "phoneNumberId",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "bodyParameters",
+              "displayName": "bodyParameters",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "array"
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "dueResponse",
+      "name": "Build Due Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        -120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only after the sender sub-workflow actually ran (this node only\n// runs after the \"Call Sender\" Execute Workflow node, on the \"Due Now?\" IF\n// node's true output). Merges the sender's own controlled response with\n// the appointmentId/dispatchAt computed by \"Validate & Classify\" --\n// forwards nothing the sender itself didn't already return: no recipient,\n// template content, credentials, headers, or raw provider data.\n\nconst senderResult = $input.first().json; // { status, httpStatus, providerMessageId }\nconst classified = $('Validate & Classify').first().json;\n\nreturn [{ json: {\n  status: senderResult.status,\n  appointmentId: classified.appointmentId,\n  dispatchAt: classified.dispatchAt,\n  httpStatus: senderResult.httpStatus,\n  providerMessageId: senderResult.providerMessageId,\n} }];\n"
+      }
+    },
+    {
+      "id": "nonSenderResponse",
+      "name": "Build Non-Sender Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached for _route in {rejected, not_due, expired}. The sender\n// sub-workflow is never invoked on this branch -- structurally guaranteed,\n// since this node only runs from the \"Due Now?\" IF node's false output,\n// which sits before the \"Call Sender\" Execute Workflow node.\n\nconst item = $input.first().json;\nreturn [{ json: {\n  status: item._route,\n  appointmentId: item.appointmentId,\n  dispatchAt: item.dispatchAt,\n  httpStatus: null,\n  providerMessageId: null,\n} }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate & Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Classify": {
+      "main": [
+        [
+          {
+            "node": "Due Now?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Due Now?": {
+      "main": [
+        [
+          {
+            "node": "Call Sender",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Non-Sender Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Sender": {
+      "main": [
+        [
+          {
+            "node": "Build Due Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": []
+}
