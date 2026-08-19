@@ -4,6 +4,8 @@
 
 Receives an inbound WhatsApp Business Cloud API-style webhook payload (as an HTTP POST) and parses a message **delivery-status** event (`sent`, `delivered`, `read`, `failed`, or any future status value Meta might add) into a small, safe summary. Delivery-status-only events are the norm for this workflow's input; malformed payloads, empty payloads, and payloads that contain an inbound *message* but no status event are all safely ignored rather than causing an error. Every execution path returns exactly the same five-field structured JSON result: `providerMessageId`, `deliveryStatus`, `eventTimestamp`, `errorCode`, `processingStatus`.
 
+**Every provider-controlled value is bounded and format-checked before use** — an oversized or control-character-laden value is rejected or normalized, never trusted as-is just because it came through as a plain string. See [Validation rules](#validation-rules).
+
 **This is a parser only.** It does **not** store anything, does **not** send any WhatsApp message, does **not** update a calendar/database/CRM, and provides no end-to-end delivery-tracking system on its own — it only turns one webhook call into a structured result. It also does **not** implement Meta's webhook verification handshake — see [Known limitations](#known-limitations) before exposing it anywhere.
 
 ## Real business use case
@@ -22,6 +24,17 @@ Built and tested against **n8n v2.35.4**, running on Node.js v22.23.2 (n8n 2.35.
 - **Respond to Webhook** (`n8n-nodes-base.respondToWebhook`, v1.5) — returns the structured JSON result.
 
 All node types are part of n8n core — no community nodes required.
+
+## Validation rules
+
+Every value taken from the inbound payload's first status event is bounded and format-checked before being reflected in the output:
+
+| Field | Rule | On failure |
+|---|---|---|
+| `providerMessageId` | Must be a string, 1–256 characters, matching `^[A-Za-z0-9._=+/-]{1,256}$` (the character set base64/URL-safe encodings actually use). | The **entire event is ignored** (`processingStatus: "ignored"`, all fields `null`) — an ID this workflow can't trust isn't reported on at all. |
+| `deliveryStatus` | Known values (`sent`, `delivered`, `read`, `failed`) always pass through. An unrecognized value only passes through if it's a **safe token**: lowercase letters/underscores only, 1–32 characters (e.g. a plausible future status name). | Any other shape (control characters, oversized, mixed case, whitespace, etc.) becomes the literal string `"unknown"` — the event is still reported (`processingStatus: "parsed"`), just without trusting the raw status text. |
+| `eventTimestamp` | Must be a bounded, digits-only string, 1–20 characters. | Returned as `null`. |
+| `errorCode` (only checked when `deliveryStatus` is `"failed"`) | Must be a safe integer, or a string matching `^[A-Za-z0-9_-]{1,64}$`. | Returned as `null`. Raw error text (`title`/`message`/`error_data`) is never read or returned under any circumstance. |
 
 ## Required credentials
 
@@ -56,25 +69,41 @@ Built and verified in an isolated local n8n test environment (no Docker availabl
    - A payload with **two** status entries → confirmed only the **first** was reflected in the output, proving the documented "first event only" limitation.
 
    All 10 returned HTTP 200 with the expected fields, and every response was confirmed programmatically to contain **exactly** the five documented fields — never a recipient phone number, message content, the raw webhook payload, or the sensitive error `title`/`message`/`error_data` text.
-3. Stopped the instance and exported the workflow using n8n's official CLI (`n8n export:workflow`).
-4. Stripped instance-specific metadata (ownership/project IDs, version bookkeeping) from the raw CLI export to produce the portable `.json` file in this repository.
-5. Spun up a **second, completely clean** n8n instance (fresh empty data directory, new SQLite database) and imported the sanitized `.json` file using n8n's official CLI (`n8n import:workflow`).
-6. Re-ran all 10 synthetic test cases against the clean, re-imported instance — every result was identical to step 2, confirmed programmatically.
-7. Removed all temporary instances, directories, and processes created for this test after evidence was collected.
+3. Ran 9 further adversarial test cases specifically exercising the [validation rules](#validation-rules) against provider-controlled values:
+   - An oversized provider message ID (500 characters) → the whole event ignored.
+   - A provider message ID containing a control character → ignored.
+   - An oversized status string (100 characters) → `deliveryStatus: "unknown"` (event still reported, `processingStatus: "parsed"`, since the message ID itself was valid).
+   - A status value containing a newline/control-character injection attempt → `deliveryStatus: "unknown"`.
+   - A valid, safely-shaped unknown future status (`"clicked"`) → passed through as-is.
+   - A malformed (non-numeric) timestamp → `eventTimestamp: null`.
+   - An oversized timestamp (30 digits) → `eventTimestamp: null`.
+   - A `failed` event whose `errors[0].code` was replaced with deliberately sensitive fabricated text (a fake email address and "secret token") → `errorCode: null`; confirmed the fabricated sensitive text never appeared anywhere in the response.
+   - A `failed` event with an oversized string error code (200 characters) → `errorCode: null`.
 
-All test payloads used only synthetic values: fake WhatsApp message IDs (`wamid.DSTESTxxxx`), fake recipient IDs, and a deliberately sensitive-looking (but entirely fabricated) error message/detail string used specifically to confirm it does **not** leak into the output — no real customer data of any kind.
+   All 9 returned HTTP 200, and every response — across all 19 test cases total — was confirmed programmatically to contain **exactly** the five documented fields.
+4. Stopped the instance and exported the workflow using n8n's official CLI (`n8n export:workflow`).
+5. Stripped instance-specific metadata (ownership/project IDs, version bookkeeping) from the raw CLI export to produce the portable `.json` file in this repository.
+6. Spun up a **second, completely clean** n8n instance (fresh empty data directory, new SQLite database) and imported the sanitized `.json` file using n8n's official CLI (`n8n import:workflow`).
+7. Re-ran all 19 synthetic test cases against the clean, re-imported instance — every result was identical to steps 2–3, confirmed programmatically.
+8. Removed all temporary instances, directories, and processes created for this test after evidence was collected.
+
+All test payloads used only synthetic values: fake WhatsApp message IDs (`wamid.DSTESTxxxx`), fake recipient IDs, and deliberately sensitive-looking (but entirely fabricated) text used specifically to confirm it does **not** leak into the output — no real customer data of any kind.
 
 ## Known limitations
 
 - **No webhook authenticity/signature verification, and no Meta GET handshake.** This workflow is POST-only and trusts whatever is sent to it. **Do not expose it directly to Meta without a verified gateway in front of it** that handles the GET verification handshake and `X-Hub-Signature-256` validation — without that, anyone who finds the URL can send it arbitrary payloads.
 - **Only the first status event in a payload is processed.** If Meta batches multiple status updates into a single webhook call, every entry after the first is silently not processed by this workflow. A production system needs to either configure Meta/its gateway to avoid batching, or extend this workflow to loop over all entries.
 - **No end-to-end delivery tracking.** This workflow does not persist status history, does not correlate a `failed` event back to the original send request, and does not retry or alert on anything — it is a single-event parser, not a tracking system.
-- **Unknown status values are passed through, not validated against a fixed list.** This is deliberate (so a future Meta status addition doesn't break this workflow) but means a caller relying on `deliveryStatus` should not assume it is always one of `sent`/`delivered`/`read`/`failed`.
+- **Unknown status values are passed through only if they look like a safe token** (see [Validation rules](#validation-rules)) — so a future Meta status addition doesn't break this workflow, but a caller relying on `deliveryStatus` should not assume it is always one of `sent`/`delivered`/`read`/`failed`; it could also be another lowercase-token value, or the literal string `"unknown"`.
 - **n8n's own execution history may retain input data.** Depending on your instance's execution-data retention settings, the full inbound webhook payload (including whatever Meta sent) may be stored locally by n8n itself (a platform behavior, not something this workflow controls) — review your own instance's settings if that matters for your data-handling policy.
 
 ## Data handled
 
-Reads the inbound webhook payload (whatever WhatsApp Cloud API sends: recipient ID, message ID, status, timestamp, and — for failures — an error object) only in memory during a single execution, to produce the parsed result. It does **not** call any external API, does **not** write to a database, and does **not** send any outbound message. Its response never includes a recipient phone number, message content, the raw webhook payload, or raw provider error text/diagnostic detail — only `providerMessageId` (an opaque message identifier, not personal data), `deliveryStatus`, `eventTimestamp`, `errorCode` (a bare numeric/string code), and `processingStatus`. It never stores anything itself — though n8n's own execution-history feature (a platform setting, not something this workflow controls) may retain a copy of each execution's input/output locally depending on your instance's execution-data retention configuration.
+Reads the inbound webhook payload (whatever WhatsApp Cloud API sends: recipient ID, message ID, status, timestamp, and — for failures — an error object) only in memory during a single execution, to produce the parsed result. It does **not** call any external API, does **not** write to a database, and does **not** send any outbound message. Its response never includes a recipient phone number, message content, the raw webhook payload, or raw provider error text/diagnostic detail — only `providerMessageId`, `deliveryStatus`, `eventTimestamp`, `errorCode` (a bounded, validated numeric/string code — see [Validation rules](#validation-rules)), and `processingStatus`.
+
+**`providerMessageId` is an opaque identifier that may be linkable to a communication or customer record and must be handled accordingly.** This workflow does not make any claim about its privacy/regulatory status (e.g. under GDPR or similar frameworks) — that determination depends on your own system, jurisdiction, and how you use the identifier downstream. Treat it with the same care as any other identifier that could be correlated back to a specific customer or conversation.
+
+It never stores anything itself — though n8n's own execution-history feature (a platform setting, not something this workflow controls) may retain a copy of each execution's input/output locally depending on your instance's execution-data retention configuration.
 
 ## License and source
 
