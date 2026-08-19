@@ -1,0 +1,119 @@
+<svg width="1200" height="360" viewBox="0 0 1200 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="heroTitle heroDesc">
+  <title id="heroTitle">n8n × WhatsApp × MCP</title>
+  <desc id="heroDesc">Dark technical banner showing an abstract network of connected automation nodes with orange, green and violet accent lines, representing n8n, WhatsApp Business Cloud API and MCP business automation for teams worldwide.</desc>
+
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0e17"/>
+      <stop offset="55%" stop-color="#0d1220"/>
+      <stop offset="100%" stop-color="#111726"/>
+    </linearGradient>
+
+    <radialGradient id="glowOrange" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ff7a1a" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#ff7a1a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowGreen" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#25d366" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#25d366" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowViolet" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#8b6bff" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#8b6bff" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="lineOrange" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ff7a1a" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#ff9a4d" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#ff7a1a" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="lineGreen" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#25d366" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#5ee89a" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#25d366" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="lineViolet" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#8b6bff" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#a98cff" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#8b6bff" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="topBar" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ff7a1a"/>
+      <stop offset="50%" stop-color="#25d366"/>
+      <stop offset="100%" stop-color="#8b6bff"/>
+    </linearGradient>
+
+    <pattern id="dotGrid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="1.4" cy="1.4" r="1.4" fill="#ffffff" fill-opacity="0.045"/>
+    </pattern>
+  </defs>
+
+  <!-- Base -->
+  <rect x="0" y="0" width="1200" height="360" fill="url(#bgGrad)"/>
+  <rect x="0" y="0" width="1200" height="360" fill="url(#dotGrid)"/>
+  <rect x="0" y="0" width="1200" height="4" fill="url(#topBar)"/>
+
+  <!-- Ambient color glows -->
+  <ellipse cx="185" cy="90" rx="230" ry="150" fill="url(#glowOrange)"/>
+  <ellipse cx="1030" cy="80" rx="240" ry="160" fill="url(#glowViolet)"/>
+  <ellipse cx="150" cy="300" rx="220" ry="140" fill="url(#glowGreen)"/>
+  <ellipse cx="1050" cy="300" rx="230" ry="150" fill="url(#glowOrange)"/>
+
+  <!-- Data-flow connective lines (static, dashed to imply direction without motion) -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M 60 70 L 260 55 L 430 110" stroke="url(#lineOrange)" stroke-width="2" stroke-dasharray="2 10"/>
+    <path d="M 40 175 L 150 205 L 260 170" stroke="url(#lineGreen)" stroke-width="2" stroke-dasharray="2 10"/>
+    <path d="M 70 290 L 250 305 L 420 260" stroke="url(#lineOrange)" stroke-width="2" stroke-dasharray="2 10"/>
+    <path d="M 780 105 L 950 65 L 1145 85" stroke="url(#lineViolet)" stroke-width="2" stroke-dasharray="2 10"/>
+    <path d="M 940 170 L 1050 205 L 1160 175" stroke="url(#lineGreen)" stroke-width="2" stroke-dasharray="2 10"/>
+    <path d="M 790 300 L 970 270 L 1160 295" stroke="url(#lineViolet)" stroke-width="2" stroke-dasharray="2 10"/>
+  </g>
+
+  <!-- Nodes: left cluster (n8n / WhatsApp side) -->
+  <g stroke-width="1.5">
+    <circle cx="60" cy="70" r="5" fill="#ff9a4d" stroke="#ffb877" stroke-opacity="0.5"/>
+    <circle cx="260" cy="55" r="4" fill="#ff9a4d" stroke="#ffb877" stroke-opacity="0.5"/>
+    <circle cx="430" cy="110" r="6" fill="#ffb877" stroke="#ffd7ab" stroke-opacity="0.6"/>
+
+    <circle cx="40" cy="175" r="5" fill="#5ee89a" stroke="#9df5c2" stroke-opacity="0.5"/>
+    <circle cx="150" cy="205" r="4" fill="#5ee89a" stroke="#9df5c2" stroke-opacity="0.5"/>
+    <circle cx="260" cy="170" r="6" fill="#9df5c2" stroke="#c9fadd" stroke-opacity="0.6"/>
+
+    <circle cx="70" cy="290" r="5" fill="#ff9a4d" stroke="#ffb877" stroke-opacity="0.5"/>
+    <circle cx="250" cy="305" r="4" fill="#ff9a4d" stroke="#ffb877" stroke-opacity="0.5"/>
+    <circle cx="420" cy="260" r="6" fill="#ffb877" stroke="#ffd7ab" stroke-opacity="0.6"/>
+  </g>
+
+  <!-- Nodes: right cluster (MCP side) -->
+  <g stroke-width="1.5">
+    <circle cx="780" cy="105" r="6" fill="#a98cff" stroke="#cabaff" stroke-opacity="0.6"/>
+    <circle cx="950" cy="65" r="4" fill="#a98cff" stroke="#cabaff" stroke-opacity="0.5"/>
+    <circle cx="1145" cy="85" r="5" fill="#c3b3ff" stroke="#dcd0ff" stroke-opacity="0.5"/>
+
+    <circle cx="940" cy="170" r="6" fill="#9df5c2" stroke="#c9fadd" stroke-opacity="0.6"/>
+    <circle cx="1050" cy="205" r="4" fill="#5ee89a" stroke="#9df5c2" stroke-opacity="0.5"/>
+    <circle cx="1160" cy="175" r="5" fill="#5ee89a" stroke="#9df5c2" stroke-opacity="0.5"/>
+
+    <circle cx="790" cy="300" r="6" fill="#a98cff" stroke="#cabaff" stroke-opacity="0.6"/>
+    <circle cx="970" cy="270" r="4" fill="#a98cff" stroke="#cabaff" stroke-opacity="0.5"/>
+    <circle cx="1160" cy="295" r="5" fill="#c3b3ff" stroke="#dcd0ff" stroke-opacity="0.5"/>
+  </g>
+
+  <!-- Central hub ring, tying the two clusters together -->
+  <circle cx="600" cy="180" r="86" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
+  <circle cx="600" cy="180" r="60" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="1"/>
+
+  <!-- Title block -->
+  <g font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" text-anchor="middle">
+    <text x="600" y="168" font-size="46" font-weight="700" fill="#f5f7fb" letter-spacing="0.5">
+      n8n <tspan fill="#ff9a4d">×</tspan> WhatsApp <tspan fill="#8b6bff">×</tspan> MCP
+    </text>
+    <text x="600" y="205" font-size="18" font-weight="400" fill="#aab2c5" letter-spacing="0.2">
+      Open automation resources for teams worldwide
+    </text>
+  </g>
+
+  <!-- Bottom hairline -->
+  <rect x="0" y="356" width="1200" height="4" fill="url(#topBar)" opacity="0.6"/>
+</svg>
