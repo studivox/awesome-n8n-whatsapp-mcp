@@ -1,0 +1,244 @@
+{
+  "id": "1ZEjGacvbL9GoKp8",
+  "name": "WhatsApp Template Message Sender",
+  "nodes": [
+    {
+      "id": "aa712c6d-dc3d-4911-a672-a07584a49647",
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        140,
+        380
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "recipientPhone",
+              "type": "string"
+            },
+            {
+              "name": "templateName",
+              "type": "string"
+            },
+            {
+              "name": "languageCode",
+              "type": "string"
+            },
+            {
+              "name": "bodyParameters",
+              "type": "array"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "07f4412d-99b8-4c6d-b72f-559dfc9b1ba1",
+      "name": "Scope Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        100,
+        80
+      ],
+      "parameters": {
+        "content": "## What this is -- and is not\\n\\n- Sends a real WhatsApp template message **only when connected to live credentials and a real Graph API URL**. Repository testing uses a local mock server, never the real Meta API.\\n- Requires a WhatsApp Business account, phone-number ID, access token, and an **already-approved** message template -- none of that is provided here.\\n- **No automatic retries** -- intentional, to avoid sending duplicate WhatsApp messages on transient failures.\\n- **No delivery-status tracking.** This only reports whether the send request was accepted, not whether the message was actually delivered/read.\\n- Never put a live access token directly in a node parameter -- always use the Header Auth credential, created manually after import.",
+        "height": 260,
+        "width": 560
+      }
+    },
+    {
+      "id": "1134e7eb-80a1-4c35-aea3-ebc4e966ec9a",
+      "name": "Validate & Build Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Validate input for sending a WhatsApp Business Cloud API template message,\n// and build the official template-message request body when valid.\n//\n// This sub-workflow is meant to be called via the Execute Workflow node from\n// another n8n workflow (it uses an Execute Workflow Trigger, not a webhook).\n\nconst input = $input.first().json;\n\nfunction isValidPhone(v) {\n  // Plausible international, digits-only, no leading +, no leading 0.\n  return typeof v === 'string' && /^[1-9]\\d{7,14}$/.test(v);\n}\nfunction isValidTemplateName(v) {\n  // Meta template names: lowercase letters, digits, underscores only.\n  return typeof v === 'string' && v.length > 0 && v.length <= 512 && /^[a-z0-9_]+$/.test(v);\n}\nfunction isValidLanguageCode(v) {\n  // e.g. \"en\", \"en_US\", \"tr\", \"nl_NL\"\n  return typeof v === 'string' && /^[a-z]{2}(_[A-Z]{2})?$/.test(v);\n}\nfunction isValidBodyParameters(v) {\n  if (v === undefined || v === null) return true;\n  if (!Array.isArray(v)) return false;\n  if (v.length > 10) return false;\n  return v.every((p) => typeof p === 'string' && p.length > 0 && p.length <= 200);\n}\n\nconst recipientPhone = input.recipientPhone;\nconst templateName = input.templateName;\nconst languageCode = input.languageCode;\nconst bodyParameters = input.bodyParameters;\n\nconst valid =\n  isValidPhone(recipientPhone) &&\n  isValidTemplateName(templateName) &&\n  isValidLanguageCode(languageCode) &&\n  isValidBodyParameters(bodyParameters);\n\nif (!valid) {\n  return [{ json: { _route: 'invalid' } }];\n}\n\nconst components = [];\nif (Array.isArray(bodyParameters) && bodyParameters.length > 0) {\n  components.push({\n    type: 'body',\n    parameters: bodyParameters.map((text) => ({ type: 'text', text })),\n  });\n}\n\nconst requestBody = {\n  messaging_product: 'whatsapp',\n  to: recipientPhone,\n  type: 'template',\n  template: {\n    name: templateName,\n    language: { code: languageCode },\n    components,\n  },\n};\n\nreturn [{ json: { _route: 'valid', requestBody } }];\n"
+      }
+    },
+    {
+      "id": "a4e6398e-e3a0-473d-bf3a-21d76443bfd5",
+      "name": "Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        650,
+        380
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "valid",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "90098b16-1f68-4f49-a393-dea448ab6992",
+      "name": "Send Template Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        900,
+        280
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WHATSAPP_GRAPH_BASE_URL }}/{{ $env.WHATSAPP_GRAPH_API_VERSION }}/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.requestBody }}",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "cf9b9fbe-a007-49de-bd6a-1a94dcd68ce3",
+      "name": "Build Response From HTTP Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1150,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// The HTTP Request node is configured with \"Never Error\" + \"Full Response\",\n// so this branch receives every HTTP response regardless of status code --\n// this node classifies it into a controlled, non-sensitive result. It never\n// forwards the raw response body/headers, the recipient number, or message\n// content -- only status / httpStatus / providerMessageId.\n\nconst item = $input.first().json; // { statusCode, headers, body }\nconst statusCode = item.statusCode;\nconst body = (item.body && typeof item.body === 'object') ? item.body : {};\n\nlet status;\nlet providerMessageId = null;\n\nif (statusCode >= 200 && statusCode < 300) {\n  status = 'sent';\n  const id = body.messages && body.messages[0] && body.messages[0].id;\n  providerMessageId = typeof id === 'string' ? id : null;\n} else if (statusCode === 401 || statusCode === 403) {\n  status = 'auth_error';\n} else if (statusCode === 429) {\n  status = 'rate_limited';\n} else if (statusCode >= 500) {\n  status = 'provider_error';\n} else if (statusCode === 400) {\n  status = 'provider_rejected';\n} else {\n  status = 'provider_rejected';\n}\n\nreturn [{ json: { status, httpStatus: statusCode, providerMessageId } }];\n"
+      }
+    },
+    {
+      "id": "0cc3acce-cc62-404a-a4ab-d90b9008192f",
+      "name": "Build Transport Failure Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1150,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only when the HTTP request itself could not complete (timeout,\n// connection refused, DNS failure, etc.) -- not a real HTTP response, so no\n// status code is available. Never forwards the raw error message or stack.\n\nreturn [{ json: { status: 'timeout', httpStatus: null, providerMessageId: null } }];\n"
+      }
+    },
+    {
+      "id": "09dc842d-444a-4b54-9f38-ef15ac1da728",
+      "name": "Build Rejected Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        520
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Input failed validation before any HTTP request was made. No provider was\n// contacted, so there is no HTTP status or provider message ID.\n\nreturn [{ json: { status: 'rejected', httpStatus: null, providerMessageId: null } }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate & Build Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Build Request": {
+      "main": [
+        [
+          {
+            "node": "Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Send Template Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Rejected Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Template Message": {
+      "main": [
+        [
+          {
+            "node": "Build Response From HTTP Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Transport Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": []
+}
