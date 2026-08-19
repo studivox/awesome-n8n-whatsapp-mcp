@@ -1,0 +1,99 @@
+{
+  "id": "OdGHJPQKByMhAoVX",
+  "name": "WhatsApp Appointment Reply Parser",
+  "nodes": [
+    {
+      "id": "5e17096c-92e2-42b5-9985-bb9be3e64c0d",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        250,
+        380
+      ],
+      "webhookId": "085d8a6f-0957-44bd-a2c0-b8125b467de5",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-appointment-reply-parser",
+        "authentication": "none",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "b9848e51-3fc4-493b-957f-0d4c54b0607a",
+      "name": "Scope Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        180,
+        100
+      ],
+      "parameters": {
+        "content": "## What this is -- and is not\\n\\n- This is a **reply parser only**. It does NOT update any calendar or database, does NOT send any WhatsApp message, and does NOT claim an appointment was actually changed -- it only reports what the customer's reply seems to say.\\n- **POST-only.** No Meta GET verification handshake or X-Hub-Signature-256 validation is implemented. Do not point Meta's webhook config directly at this URL as-is -- test with a synthetic HTTP client instead.\\n- Classification is deterministic word/phrase matching, not AI/ML. Conflicting or absent signals route to manual_review rather than guessing.\\n- Adapt keywords and languages to your business before relying on this.",
+        "height": 260,
+        "width": 500
+      }
+    },
+    {
+      "id": "94635fbb-b80c-4f10-8572-7ec86e7db4d0",
+      "name": "Normalize, Validate & Classify Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Parse an inbound WhatsApp Cloud API text reply to an appointment message and\n// classify it as confirmed / cancelled / reschedule_requested / manual_review,\n// using deterministic, word/phrase-aware keyword matching.\n//\n// This is a REPLY PARSER only -- it does not update any calendar or database,\n// does not send any WhatsApp message, and does not claim that an appointment\n// was actually changed. It only reports what the customer's reply seems to say.\n//\n// NOTE: this endpoint is POST-only. It does NOT implement Meta's required GET\n// verification handshake or X-Hub-Signature-256 signature validation. Test it\n// with any synthetic HTTP client; do not point Meta's webhook config at it\n// as-is -- see this workflow's documentation for what a production setup needs.\n\nconst item = $input.first().json;\nconst payload = item.body !== undefined ? item.body : item;\n\nfunction safeGet(obj, path, fallback) {\n  try {\n    let cur = obj;\n    for (const key of path) {\n      if (cur === null || cur === undefined) return fallback;\n      cur = cur[key];\n    }\n    return cur === undefined ? fallback : cur;\n  } catch (e) {\n    return fallback;\n  }\n}\n\n// Word/phrase-aware matcher: \\b boundaries so \"yes\" won't match inside\n// \"yesterday\". Multi-word phrases (e.g. \"another day\") match as a phrase\n// with flexible whitespace between words.\nfunction buildMatcher(keyword) {\n  const escaped = keyword.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n  const pattern = escaped.includes(' ') ? escaped.replace(/ /g, '\\\\s+') : escaped;\n  return new RegExp('\\\\b' + pattern + '\\\\b');\n}\n\nfunction matchingCategories(text, keywordMap) {\n  const hits = [];\n  for (const [category, keywords] of Object.entries(keywordMap)) {\n    if (keywords.some((k) => buildMatcher(k).test(text))) hits.push(category);\n  }\n  return hits;\n}\n\nlet result;\n\ntry {\n  if (!payload || typeof payload !== 'object') {\n    result = { action: null, messageType: 'malformed', status: 'ignored' };\n  } else {\n    const entry = safeGet(payload, ['entry', 0], null);\n    const change = entry ? safeGet(entry, ['changes', 0], null) : null;\n    const value = change ? safeGet(change, ['value'], null) : null;\n\n    if (!value) {\n      result = { action: null, messageType: 'malformed', status: 'ignored' };\n    } else {\n      const messages = Array.isArray(value.messages) ? value.messages : [];\n      const statuses = Array.isArray(value.statuses) ? value.statuses : [];\n\n      if (messages.length === 0) {\n        if (statuses.length > 0) {\n          result = { action: null, messageType: 'status_event', status: 'ignored' };\n        } else {\n          result = { action: null, messageType: 'malformed', status: 'ignored' };\n        }\n      } else {\n        const firstMessage = messages[0];\n        const msgType = firstMessage.type;\n        const text = msgType === 'text' ? safeGet(firstMessage, ['text', 'body'], '') : '';\n\n        if (msgType !== 'text' || !text || typeof text !== 'string' || text.trim() === '') {\n          result = { action: null, messageType: msgType || 'unknown', status: 'ignored' };\n        } else {\n          const normalized = text.trim().toLowerCase();\n\n          // Deterministic keyword routing -- not AI/ML. Adapt to your language(s)\n          // and vocabulary; this is a starting template, not a finished parser.\n          const KEYWORDS = {\n            confirmed: ['confirm', 'confirmed', 'confirming', \"i'll be there\", 'ill be there', 'i will be there', 'count me in', 'yes'],\n            cancelled: ['cancel', 'cancelled', 'canceling', 'cancelling', \"can't make it\", 'cant make it', 'not able to make it'],\n            reschedule_requested: ['reschedule', 'move it', 'another day', 'different day', 'different time', 'change the time', 'postpone', 'push back'],\n          };\n\n          const hits = matchingCategories(normalized, KEYWORDS);\n          // Exactly one category matched -> use it. Zero matches (no signal) or\n          // more than one (conflicting signals, e.g. \"confirm\" and \"cancel\" both\n          // present) -> manual_review is the safe default rather than guessing.\n          const action = hits.length === 1 ? hits[0] : 'manual_review';\n\n          result = { action, messageType: 'text', status: 'classified' };\n        }\n      }\n    }\n  }\n} catch (err) {\n  result = { action: null, messageType: 'malformed', status: 'ignored' };\n}\n\nreturn [{ json: result }];\n"
+      }
+    },
+    {
+      "id": "d00cbeac-df1a-4f8d-b3e4-e92107fc6cff",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        800,
+        380
+      ],
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize, Validate & Classify Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize, Validate & Classify Reply": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": []
+}

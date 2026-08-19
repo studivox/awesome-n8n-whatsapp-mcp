@@ -2,7 +2,12 @@
 
 This folder holds real, sanitized n8n workflow exports for WhatsApp Business Cloud API and related business-automation use cases (appointments, invoicing, customer support) for teams worldwide. Where a workflow depends on country-specific rules (e.g. invoicing compliance), that's called out explicitly in its own documentation as a regional variant — see [Global scope and regional resources](../README.md#global-scope-and-regional-resources).
 
-**Status: one workflow package is published** — [`whatsapp-inbound-support-router.json`](whatsapp-inbound-support-router.json) / [`whatsapp-inbound-support-router.md`](whatsapp-inbound-support-router.md). This repository does not ship placeholder or fabricated workflow JSON — every entry here must be a real, working export that has actually been run and re-imported into a clean instance. See the planned pipeline in [`docs/ROADMAP.md`](../docs/ROADMAP.md).
+**Status: two workflow packages are published:**
+
+- [`whatsapp-inbound-support-router.json`](whatsapp-inbound-support-router.json) / [`whatsapp-inbound-support-router.md`](whatsapp-inbound-support-router.md)
+- [`whatsapp-appointment-reply-parser.json`](whatsapp-appointment-reply-parser.json) / [`whatsapp-appointment-reply-parser.md`](whatsapp-appointment-reply-parser.md)
+
+This repository does not ship placeholder or fabricated workflow JSON — every entry here must be a real, working export that has actually been run and re-imported into a clean instance. See the planned pipeline in [`docs/ROADMAP.md`](../docs/ROADMAP.md).
 
 ## Submission format
 
