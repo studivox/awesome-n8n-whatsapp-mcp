@@ -1,6 +1,6 @@
 <svg width="1200" height="360" viewBox="0 0 1200 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="heroTitle heroDesc">
   <title id="heroTitle">n8n × WhatsApp × MCP</title>
-  <desc id="heroDesc">Dark technical banner showing an abstract network of connected automation nodes with orange, green and violet accent lines, representing n8n, WhatsApp Business Cloud API and MCP business automation for Türkiye and the Netherlands.</desc>
+  <desc id="heroDesc">Dark technical banner showing an abstract network of connected automation nodes with orange, green and violet accent lines, representing n8n, WhatsApp Business Cloud API and MCP business automation for teams worldwide.</desc>
 
   <defs>
     <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -110,7 +110,7 @@
       n8n <tspan fill="#ff9a4d">×</tspan> WhatsApp <tspan fill="#8b6bff">×</tspan> MCP
     </text>
     <text x="600" y="205" font-size="18" font-weight="400" fill="#aab2c5" letter-spacing="0.2">
-      Business automation workflows for Türkiye and the Netherlands
+      Open automation resources for teams worldwide
     </text>
   </g>
 

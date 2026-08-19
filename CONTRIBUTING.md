@@ -20,7 +20,7 @@ Thanks for helping grow this project. Please read this before opening a PR.
 - Entries without a working, specific link.
 - Self-promotional or unused "boilerplate" repos.
 - Projects with no commits in the last 6+ months (unless it's a stable official reference, e.g. platform documentation).
-- Resources already covered by general-purpose English "awesome n8n" lists that add no TR/NL business-automation context.
+- Resources already covered by general-purpose English "awesome n8n" lists that add nothing specific to WhatsApp/Postgres/MCP business automation, or to a regional compliance module (see [Global scope and regional resources](README.md#global-scope-and-regional-resources)).
 - Projects whose setup instructions don't actually work.
 - Marketing language ("best", "guaranteed to work") instead of plain technical description.
 - Fabricated star counts, popularity claims, or "personally tested" claims without evidence.

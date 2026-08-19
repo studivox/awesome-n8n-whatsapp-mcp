@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/assets/hero-banner.svg" alt="Dark technical banner titled n8n times WhatsApp times MCP, showing abstract connected automation nodes in orange, green and violet, with the supporting text: business automation workflows for Türkiye and the Netherlands" width="900" style="max-width:100%;" />
+  <img src="docs/assets/hero-banner.svg" alt="Dark technical banner titled n8n times WhatsApp times MCP, showing abstract connected automation nodes in orange, green and violet, with the supporting text: open automation resources for teams worldwide" width="900" style="max-width:100%;" />
 </p>
 
-<h3 align="center">Practical n8n, WhatsApp and MCP automation resources for real businesses in Türkiye and the Netherlands.</h3>
+<h3 align="center">Curated n8n, WhatsApp and MCP automation resources for teams and businesses worldwide.</h3>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: CC0-1.0" src="https://img.shields.io/badge/license-CC0--1.0-blue"></a>
@@ -33,7 +33,7 @@
 - [Workflow quality requirements](#workflow-quality-requirements)
 - [Available and planned workflows](#available-and-planned-workflows)
 - [How validation works](#how-validation-works)
-- [Türkiye and Netherlands focus](#türkiye-and-netherlands-focus)
+- [Global scope and regional resources](#global-scope-and-regional-resources)
 - [Security and privacy](#security-and-privacy)
 - [Repository structure](#repository-structure)
 - [Contributing](#contributing)
@@ -47,7 +47,7 @@
 
 | | |
 |---|---|
-| ✅ | Curated resource foundation is live: verified official documentation and repositories for n8n, WhatsApp Cloud API, Postgres, Google Calendar, NL VAT/BTW, TR e-Fatura, and MCP. |
+| ✅ | Curated resource foundation is live: verified official documentation and repositories for n8n, WhatsApp Cloud API, Postgres, Google Calendar, MCP, and regional compliance references (VAT/BTW, e-Fatura). |
 | 🚧 | **No runnable workflow `.json` file has been published yet.** The `workflows/` folder currently defines the submission format only. |
 | 📦 | Workflow submissions require a real n8n export plus matching documentation — see [Workflow package contract](#how-workflow-packages-work). |
 | 🔍 | A workflow is only listed as available after sanitization, a clean import test, and passing [automated validation](#how-validation-works). |
@@ -56,12 +56,21 @@ Nothing in this README is described as "production-tested" or "production-ready"
 
 ## Why this project exists
 
-General-purpose "awesome n8n" lists already exist and are large. What's missing is a resource specifically for the **n8n + WhatsApp Cloud API + Postgres** combination used in real business automation — appointment booking, customer support, invoicing — plus the invoicing and tax-compliance context specific to the **Dutch (ZZP/BTW/KVK)** and **Turkish (e-Fatura/e-Arşiv)** markets, which is otherwise scattered across local forums and undocumented in English.
+General-purpose "awesome n8n" lists already exist and are large. What's missing is a resource focused specifically on the **n8n + WhatsApp Cloud API + Postgres** combination used in real, globally reusable business automation:
+
+- **Customer communication** — WhatsApp Business Cloud API messaging, templates, and webhooks
+- **Appointment management** — booking, reminders, confirmation and cancellation flows
+- **Support routing** — directing inbound messages to the right handler
+- **Database synchronization** — keeping calendars, records, and messaging state in sync via Postgres
+- **Invoicing** — automated quotation and payment-reminder workflows, with compliance details handled as regional add-ons (see [Global scope and regional resources](#global-scope-and-regional-resources))
+- **AI and MCP integrations** — connecting n8n automations to MCP-based tools and agents
+
+These use cases apply to teams and businesses anywhere — this project curates and, over time, publishes real automation packages built around them, rather than generic demos.
 
 ## What you can find here
 
-- A **verified resource library**: official documentation and primary repositories for n8n, WhatsApp Business Cloud API, Postgres, Google Calendar, MCP, and NL/TR invoicing systems — every link checked live before being added.
-- A strict **workflow package contract**: every future workflow ships as a matched `.json` export + `.md` documentation pair, sanitized and tested before being listed.
+- A **verified resource library**: official documentation and primary repositories for n8n, WhatsApp Business Cloud API, Postgres, Google Calendar, MCP, and — as clearly labelled regional examples — invoicing/compliance systems such as Dutch VAT/BTW and Turkish e-Fatura. Every link is checked live before being added.
+- A strict **workflow package contract**: every future workflow ships as a matched `.json` export + `.md` documentation pair, sanitized and tested before being listed, and built to be reusable regardless of where the business operates.
 - An **automated validation system** (`scripts/validate_repository.py` + CI) that checks workflow structure, required documentation, obvious secret patterns, and repository hygiene on every pull request.
 
 ## Browse verified resources
@@ -95,17 +104,14 @@ Every entry below is a live, specific, official link — not a placeholder or an
 |---|---|
 | [n8n Google Calendar node docs](https://docs.n8n.io/integrations/builtin/app-nodes/n8n-nodes-base.googlecalendar/) | Official documentation for OAuth setup and event CRUD operations. |
 
-### Netherlands VAT / BTW
+### Regional Compliance Resources
 
-| Resource | Description |
-|---|---|
-| [Belastingdienst — BTW voor ondernemers](https://www.belastingdienst.nl/wps/wcm/connect/bldcontenten/belastingdienst/business/vat/vat) | Official Dutch tax authority reference for VAT (BTW) rules for freelancers (ZZP) and businesses. |
+Invoicing and tax rules are inherently local. This project's workflows are built for global use, and this section holds official, region-specific references for the countries covered **so far** — not a boundary on which regions are supported. See [Global scope and regional resources](#global-scope-and-regional-resources) for how new regions get added.
 
-### Türkiye e-Fatura / e-Arşiv
-
-| Resource | Description |
-|---|---|
-| [e-Fatura Portalı (GİB)](https://www.efatura.gov.tr/) | Official Turkish Revenue Administration portal for e-Invoice (e-Fatura) / e-Archive (e-Arşiv) systems. |
+| Region | Resource | Description |
+|---|---|---|
+| Netherlands | [Belastingdienst — BTW voor ondernemers](https://www.belastingdienst.nl/wps/wcm/connect/bldcontenten/belastingdienst/business/vat/vat) | Official Dutch tax authority reference for VAT (BTW) rules for freelancers (ZZP) and businesses. |
+| Türkiye | [e-Fatura Portalı (GİB)](https://www.efatura.gov.tr/) | Official Turkish Revenue Administration portal for e-Invoice (e-Fatura) / e-Archive (e-Arşiv) systems. |
 
 ### MCP Servers and SDKs
 
@@ -223,9 +229,11 @@ flowchart TD
 
 This is a **defensive quality gate, not a guarantee** — it cannot detect every possible secret or unsafe pattern. Human review of every workflow before import and activation is still required.
 
-## Türkiye and Netherlands focus
+## Global scope and regional resources
 
-WhatsApp is the dominant business messaging channel in both Türkiye and the Netherlands, and both markets have automation-relevant compliance requirements that general English-language n8n resources don't cover: Dutch BTW/KVK rules for freelancers and small businesses, and Turkish e-Fatura/e-Arşiv electronic invoicing. This project curates and, over time, publishes real automation packages built around those specific requirements — appointment workflows, invoice reminders, and customer communication — rather than generic demos.
+This project is built for teams and businesses anywhere. The core workflow categories — customer communication, appointment management, support routing, database synchronization, invoicing, and AI/MCP integrations — are designed to be reusable regardless of country.
+
+Where automation touches something inherently local, like tax and invoicing compliance, general English-language n8n resources often don't cover the local requirements at all. Rather than ignore that, this project adds **clearly labelled regional modules**: official compliance references and (over time) region-specific workflow variants, kept separate from the core, globally applicable resources. Dutch VAT/BTW and Turkish e-Fatura/e-Arşiv (see [Regional Compliance Resources](#regional-compliance-resources)) are the first two such modules — a starting point, not the project's boundary. Additional regions are added the same way: as opt-in, explicitly labelled modules, contributed via the normal [contribution process](#contributing).
 
 ## Security and privacy
 

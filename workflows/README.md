@@ -1,6 +1,6 @@
 # Workflows
 
-This folder holds real, sanitized n8n workflow exports for WhatsApp Business Cloud API and related business-automation use cases (appointments, invoicing, customer support) for the Turkish and Dutch markets.
+This folder holds real, sanitized n8n workflow exports for WhatsApp Business Cloud API and related business-automation use cases (appointments, invoicing, customer support) for teams worldwide. Where a workflow depends on country-specific rules (e.g. invoicing compliance), that's called out explicitly in its own documentation as a regional variant — see [Global scope and regional resources](../README.md#global-scope-and-regional-resources).
 
 **Status: no workflow files have been added yet.** This repository does not ship placeholder or fabricated workflow JSON — every entry here must be a real, working export that has actually been run. See the planned pipeline in [`docs/ROADMAP.md`](../docs/ROADMAP.md).
 
