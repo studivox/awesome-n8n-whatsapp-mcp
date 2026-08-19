@@ -17,7 +17,7 @@
 </p>
 
 > [!NOTE]
-> **Current status:** the curated resource foundation is live, and the first sanitized, tested workflow package has been published. See [Current status](#current-status) below for exactly what that does and doesn't mean.
+> **Current status:** the curated resource foundation is live, and two sanitized, tested workflow packages have been published. See [Current status](#current-status) below for exactly what that does and doesn't mean.
 
 ---
 
@@ -48,12 +48,12 @@
 | | |
 |---|---|
 | ✅ | Curated resource foundation is live: verified official documentation and repositories for n8n, WhatsApp Cloud API, Postgres, Google Calendar, MCP, and regional compliance references (VAT/BTW, e-Fatura). |
-| ✅ | One sanitized, tested workflow package is published — see [Available and planned workflows](#available-and-planned-workflows). It is **not** described as production-ready or production-tested; it's a verified template with documented limitations. |
+| ✅ | Two sanitized, tested workflow packages are published — see [Available and planned workflows](#available-and-planned-workflows). Neither is described as production-ready or production-tested; both are verified templates with documented limitations. |
 | 🚧 | Everything else in the [planned roadmap](#available-and-planned-workflows) remains unbuilt. |
 | 📦 | Workflow submissions require a real n8n export plus matching documentation — see [Workflow package contract](#how-workflow-packages-work). |
 | 🔍 | A workflow is only listed as available after sanitization, a clean import test, and passing [automated validation](#how-validation-works). |
 
-Nothing in this README is described as "production-tested" or "production-ready." The one published workflow is described as tested and verified — with its exact scope and limitations documented alongside it — never as more than that.
+Nothing in this README is described as "production-tested" or "production-ready." Each published workflow is described as tested and verified — with its exact scope and limitations documented alongside it — never as more than that.
 
 ## Why this project exists
 
@@ -188,6 +188,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full sanitization checklist tha
 | Workflow | Files | Status |
 |---|---|---|
 | WhatsApp inbound support router | [`.json`](workflows/whatsapp-inbound-support-router.json) · [`.md`](workflows/whatsapp-inbound-support-router.md) | Available — sanitized, tested, re-import verified. **Not** described as production-ready; see the workflow's own [Known limitations](workflows/whatsapp-inbound-support-router.md#known-limitations). |
+| WhatsApp appointment reply parser | [`.json`](workflows/whatsapp-appointment-reply-parser.json) · [`.md`](workflows/whatsapp-appointment-reply-parser.md) | Available — sanitized, tested, re-import verified. A **reply parser only**: classifies a customer's free-text reply, but does not update a calendar/database or send any message. **Not** described as production-ready; see the workflow's own [Known limitations](workflows/whatsapp-appointment-reply-parser.md#known-limitations). |
 
 ### Planned roadmap
 

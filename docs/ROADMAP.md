@@ -9,13 +9,14 @@ A workflow moves out of the planned list and into [`workflows/`](../workflows/RE
 | Workflow | Files | Notes |
 |---|---|---|
 | WhatsApp inbound support router | [`.json`](../workflows/whatsapp-inbound-support-router.json) · [`.md`](../workflows/whatsapp-inbound-support-router.md) | Deterministic keyword routing into appointments/billing/support/general. Sanitized, tested, re-import verified. Not production-ready — see its documented limitations. |
+| WhatsApp appointment reply parser | [`.json`](../workflows/whatsapp-appointment-reply-parser.json) · [`.md`](../workflows/whatsapp-appointment-reply-parser.md) | Classifies a customer's free-text reply as confirmed/cancelled/reschedule_requested/manual_review. A **building block, not the full automation** — it does not touch a calendar or database, and does not send any message. Sanitized, tested, re-import verified. Not production-ready. |
 
 ## Planned workflows
 
 | Workflow | Status | Notes |
 |---|---|---|
 | WhatsApp appointment reminder | Planned — not available yet | Sends a reminder ahead of a scheduled appointment. |
-| WhatsApp appointment confirmation and cancellation | Planned — not available yet | Handles the confirm/cancel reply flow for a booking. |
+| WhatsApp appointment confirmation and cancellation | Planned — not available yet | The full calendar/database-updating automation. The available "WhatsApp appointment reply parser" above only classifies the customer's reply text — this planned item is the end-to-end automation that would act on that classification. |
 | Google Calendar ↔ Postgres synchronization | Planned — not available yet | Keeps appointment records and calendar events in sync. |
 | Unpaid invoice reminder | Planned — not available yet | Automated follow-up for overdue invoices. |
 | Customer quotation delivery | Planned — not available yet | Generates and delivers a quotation to a customer. |
