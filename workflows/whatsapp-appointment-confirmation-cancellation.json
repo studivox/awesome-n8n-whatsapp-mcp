@@ -1,0 +1,755 @@
+{
+  "name": "WhatsApp Appointment Confirmation and Cancellation",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "replyEventId",
+              "type": "string"
+            },
+            {
+              "name": "appointmentId",
+              "type": "string"
+            },
+            {
+              "name": "action",
+              "type": "string"
+            },
+            {
+              "name": "expectedVersion",
+              "type": "number"
+            },
+            {
+              "name": "calendarEventId",
+              "type": "string"
+            },
+            {
+              "name": "actionTimestamp",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "scopeNote",
+      "name": "Scope Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -420
+      ],
+      "parameters": {
+        "content": "## WhatsApp Appointment Confirmation and Cancellation\\n\\n- **Consumes** the already-classified `action` from whatsapp-appointment-reply-parser.json -- does not re-classify any reply text itself.\\n- **Postgres is the source of truth.** Every action is recorded with optimistic-concurrency (`expectedVersion`) and durable idempotency (`replyEventId`) BEFORE any calendar call is attempted.\\n- **No single atomic transaction spans Postgres and Google Calendar** -- a calendar failure after a successful database write is reported honestly as `calendar_sync_failed`, never as false success.\\n- **No automatic retries anywhere in this workflow.**",
+        "height": 340,
+        "width": 560
+      }
+    },
+    {
+      "id": "validate",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Validates a reply-parser action request. Does NOT classify a customer's\n// reply -- that logic lives only in whatsapp-appointment-reply-parser.json.\n// This node only validates/consumes the ALREADY-classified `action`.\n//\n// Every identifier is echoed back in the controlled output ONLY if it\n// itself passes full validation -- an invalid, oversized, or otherwise\n// attacker-controlled string is NEVER echoed, even partially. This mirrors\n// the same fix applied to whatsapp-appointment-reminder.json's appointmentId\n// handling.\n\nconst input = $input.first().json;\n\nfunction isValidOpaqueId(v, maxLength) {\n  return typeof v === 'string' && v.length >= 1 && v.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(v);\n}\nfunction isValidAction(v) {\n  return v === 'confirmed' || v === 'cancelled' || v === 'reschedule_requested' || v === 'manual_review';\n}\nfunction isValidExpectedVersion(v) {\n  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 1000000000;\n}\nfunction isValidActionTimestamp(v) {\n  // Same strict, component-level ISO-8601 validation used by\n  // whatsapp-appointment-reminder.json's appointmentStart field -- regex\n  // alone (or Date.parse() alone) is not enough, since JavaScript's Date\n  // silently normalizes impossible calendar dates instead of rejecting\n  // them. Every component is validated by hand before Date.parse() runs.\n  if (typeof v !== 'string') return false;\n  const match = /^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.\\d{1,3})?(Z|[+-]\\d{2}:\\d{2})$/.exec(v);\n  if (!match) return false;\n\n  const year = Number(match[1]);\n  const month = Number(match[2]);\n  const day = Number(match[3]);\n  const hour = Number(match[4]);\n  const minute = Number(match[5]);\n  const second = Number(match[6]);\n  const offset = match[7];\n\n  if (month < 1 || month > 12) return false;\n  const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;\n  const daysInMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];\n  if (day < 1 || day > daysInMonth[month - 1]) return false;\n  if (hour > 23) return false;\n  if (minute > 59) return false;\n  if (second > 59) return false;\n\n  if (offset !== 'Z') {\n    const offsetMatch = /^([+-])(\\d{2}):(\\d{2})$/.exec(offset);\n    const offsetSign = offsetMatch[1];\n    const offsetHour = Number(offsetMatch[2]);\n    const offsetMinute = Number(offsetMatch[3]);\n    if (offsetHour > 14) return false;\n    if (offsetMinute > 59) return false;\n    if (offsetSign === '+' && offsetHour === 14 && offsetMinute !== 0) return false;\n    if (offsetSign === '-' && offsetHour > 12) return false;\n  }\n\n  return Number.isFinite(Date.parse(v));\n}\n\nconst replyEventId = input.replyEventId;\nconst appointmentId = input.appointmentId;\nconst action = input.action;\nconst expectedVersion = input.expectedVersion;\nconst calendarEventId = input.calendarEventId;\nconst actionTimestamp = input.actionTimestamp;\n\nconst replyEventIdValid = isValidOpaqueId(replyEventId, 128);\nconst appointmentIdValid = isValidOpaqueId(appointmentId, 128);\nconst actionValid = isValidAction(action);\nconst expectedVersionValid = isValidExpectedVersion(expectedVersion);\nconst actionTimestampValid = isValidActionTimestamp(actionTimestamp);\n\n// calendarEventId is only REQUIRED when the action will mutate the\n// calendar (confirmed/cancelled). For reschedule_requested/manual_review\n// it is optional -- provide null/omit it if you don't have one.\nconst requiresCalendar = action === 'confirmed' || action === 'cancelled';\nconst calendarEventIdProvided = calendarEventId !== undefined && calendarEventId !== null;\nconst calendarEventIdValid = requiresCalendar\n  ? (calendarEventIdProvided && isValidOpaqueId(calendarEventId, 1024))\n  : (!calendarEventIdProvided || isValidOpaqueId(calendarEventId, 1024));\n\nconst valid =\n  replyEventIdValid &&\n  appointmentIdValid &&\n  actionValid &&\n  expectedVersionValid &&\n  actionTimestampValid &&\n  calendarEventIdValid;\n\nif (!valid) {\n  return [{ json: {\n    _route: 'rejected',\n    replyEventId: replyEventIdValid ? replyEventId : null,\n    appointmentId: appointmentIdValid ? appointmentId : null,\n  } }];\n}\n\nreturn [{ json: {\n  _route: 'valid',\n  replyEventId,\n  appointmentId,\n  action,\n  expectedVersion,\n  calendarEventId: calendarEventIdProvided ? calendarEventId : null,\n  actionTimestamp,\n} }];\n"
+      }
+    },
+    {
+      "id": "ifValid",
+      "name": "Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "valid",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "buildRejected",
+      "name": "Build Rejected Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        260
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only when input validation failed -- zero database and zero\n// calendar mutations were made, structurally guaranteed (this node only\n// runs from the \"Input Valid?\" IF node's false output, before any Postgres\n// or HTTP node in this workflow).\n\nconst item = $input.first().json;\nreturn [{ json: {\n  status: 'rejected',\n  replyEventId: item.replyEventId,\n  appointmentId: item.appointmentId,\n  version: null,\n  httpStatus: null,\n} }];\n"
+      }
+    },
+    {
+      "id": "reserve",
+      "name": "Reserve Idempotency",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        780,
+        -120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Atomically reserves this replyEventId for processing. If a row with\n-- this reply_event_id already exists, ON CONFLICT DO NOTHING means this\n-- INSERT has no effect (reserved_count = 0) -- the caller must not repeat\n-- any appointment mutation or calendar call for a duplicate.\n--\n-- The scalar-subquery SELECT below always returns exactly one row (even\n-- when the INSERT was skipped), which was verified experimentally to be\n-- necessary: a Postgres node that returns zero rows produces zero output\n-- items in n8n, and a zero-item input means every downstream node -- IF\n-- nodes included -- silently does not execute for that path at all,\n-- rather than taking a \"false\" branch. Always returning exactly one row\n-- keeps every branch decision an explicit, testable IF condition instead.\nWITH reserve AS (\n  INSERT INTO reply_events (reply_event_id, appointment_id, action, result_status)\n  VALUES ($1, $2, $3, 'processing')\n  ON CONFLICT (reply_event_id) DO NOTHING\n  RETURNING reply_event_id\n)\nSELECT\n  (SELECT count(*) FROM reserve)::int AS reserved_count,\n  (SELECT result_status FROM reply_events WHERE reply_event_id = $1) AS existing_result_status;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.replyEventId, $json.appointmentId, $json.action] }}"
+        }
+      }
+    },
+    {
+      "id": "ifReserved",
+      "name": "Reserved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1040,
+        -120
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.reserved_count }}",
+              "rightValue": 1,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "buildDuplicate",
+      "name": "Build Duplicate Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        140
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only when \"Reserve Idempotency\" found an existing reply_events\n// row for this replyEventId (reserved_count = 0) -- structurally, this\n// path never reaches the appointment-update Postgres node or the calendar\n// HTTP node, so zero repeated mutations of either kind occur.\n\nconst validated = $('Validate Input').first().json;\n\nreturn [{ json: {\n  status: 'duplicate',\n  replyEventId: validated.replyEventId,\n  appointmentId: validated.appointmentId,\n  version: null,\n  httpStatus: null,\n} }];\n"
+      }
+    },
+    {
+      "id": "update",
+      "name": "Apply Optimistic Update",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1300,
+        -300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Optimistic-concurrency update: only succeeds if the caller's\n-- expectedVersion still matches the appointment's current version. This\n-- is the sole concurrency-safety mechanism -- verified experimentally\n-- (including under a genuinely stale version) to never overwrite a row\n-- whose version has already moved on, because the WHERE clause itself is\n-- the atomic compare-and-set: Postgres's row-level locking during UPDATE\n-- means a second, concurrent attempt with the same expectedVersion\n-- re-reads the ALREADY-updated row and its WHERE clause no longer\n-- matches.\n--\n-- Applies to all four actions uniformly (confirmed/cancelled/\n-- reschedule_requested/manual_review) -- appointments.status always\n-- reflects the caller's classified action once accepted; only\n-- confirmed/cancelled additionally trigger a calendar mutation later.\n--\n-- Always returns exactly one row (see the note in \"Reserve Idempotency\"\n-- for why this matters for n8n's per-item execution model).\nWITH updated AS (\n  UPDATE appointments\n  SET status = $3, version = version + 1, updated_at = now()\n  WHERE appointment_id = $1 AND version = $2\n  RETURNING appointment_id, calendar_event_id, version\n)\nSELECT\n  (SELECT count(*) FROM updated)::int AS updated_count,\n  (SELECT calendar_event_id FROM updated) AS calendar_event_id,\n  (SELECT version FROM updated) AS new_version,\n  EXISTS(SELECT 1 FROM appointments WHERE appointment_id = $1) AS appointment_exists;\n",
+        "options": {
+          "queryReplacement": "={{ [$('Validate Input').item.json.appointmentId, $('Validate Input').item.json.expectedVersion, $('Validate Input').item.json.action] }}"
+        }
+      }
+    },
+    {
+      "id": "classifyUpdate",
+      "name": "Classify Update Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        -300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Classifies the optimistic-update result. Verified experimentally\n// (against a real isolated Postgres instance) that appointment_exists\n// correctly reflects the CURRENT committed state even when updated_count\n// is 0 -- distinguishing \"no such appointment\" from \"appointment exists\n// but expectedVersion is stale\" (a newer state already won).\n\nconst result = $input.first().json;\nconst validated = $('Validate Input').first().json;\n\nlet updateRoute;\nif (result.updated_count === 1) {\n  updateRoute = 'updated';\n} else if (!result.appointment_exists) {\n  updateRoute = 'missing_appointment';\n} else {\n  updateRoute = 'conflict';\n}\n\nreturn [{ json: {\n  _updateRoute: updateRoute,\n  replyEventId: validated.replyEventId,\n  appointmentId: validated.appointmentId,\n  action: validated.action,\n  calendarEventId: result.calendar_event_id !== undefined && result.calendar_event_id !== null ? result.calendar_event_id : validated.calendarEventId,\n  newVersion: result.new_version !== undefined ? result.new_version : null,\n} }];\n"
+      }
+    },
+    {
+      "id": "ifUpdated",
+      "name": "Updated Successfully?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1820,
+        -300
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._updateRoute }}",
+              "rightValue": "updated",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "recordNonUpdate",
+      "name": "Record Non-Update Outcome",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2080,
+        20
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Records the final (non-success) outcome for this reply event. The\n-- appointments table is NOT touched here -- the optimistic update already\n-- failed to apply, by design (missing appointment or stale version).\nUPDATE reply_events SET result_status = $2 WHERE reply_event_id = $1 RETURNING reply_event_id;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.replyEventId, $json._updateRoute] }}"
+        }
+      }
+    },
+    {
+      "id": "buildUpdateFailure",
+      "name": "Build Update Failure Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        20
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only when the optimistic update did not apply -- structurally,\n// this path never reaches the calendar HTTP node, so zero calendar\n// mutations occur for a missing appointment or a stale expectedVersion.\n\nconst classified = $('Classify Update Result').first().json;\n\nreturn [{ json: {\n  status: classified._updateRoute, // 'missing_appointment' | 'conflict'\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  version: null,\n  httpStatus: null,\n} }];\n"
+      }
+    },
+    {
+      "id": "ifRequiresCalendar",
+      "name": "Requires Calendar Mutation?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2080,
+        -420
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "or",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "confirmed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "cancelled",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "recordNoCalendar",
+      "name": "Record No-Calendar Outcome",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2340,
+        -220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- reschedule_requested / manual_review: the appointment's status was\n-- already updated by the optimistic-update query above. This only\n-- finalizes the reply_events outcome -- no calendar call is ever made for\n-- these two actions.\nUPDATE reply_events SET result_status = $2 WHERE reply_event_id = $1 RETURNING reply_event_id;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.replyEventId, $json.action] }}"
+        }
+      }
+    },
+    {
+      "id": "buildNoCalendar",
+      "name": "Build No-Calendar Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        -220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only for action IN ('reschedule_requested', 'manual_review') --\n// structurally, this path never reaches the calendar HTTP node.\n// reschedule_requested does not invent a new appointment time; it only\n// records that a reschedule was requested for human/downstream handling.\n// manual_review makes no calendar mutation, ever.\n\nconst classified = $('Classify Update Result').first().json;\n\nreturn [{ json: {\n  status: classified.action, // 'reschedule_requested' | 'manual_review'\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  version: classified.newVersion,\n  httpStatus: null,\n} }];\n"
+      }
+    },
+    {
+      "id": "buildCalendarRequest",
+      "name": "Build Calendar Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        -620
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Builds the Google Calendar API request for confirmed/cancelled actions\n// only -- reached only after the appointment's own database state was\n// already durably updated by the optimistic-update query. The calendar\n// host is a FIXED constant (like the Meta Graph API host in\n// whatsapp-template-message-sender.json) -- never taken from input, so a\n// caller cannot redirect this workflow's outbound request anywhere else.\n// A single default calendar (\"primary\", the authenticated account's own\n// calendar) is used; this workflow does not accept a caller-supplied\n// calendar ID.\n\nconst classified = $('Classify Update Result').first().json;\n\nconst CALENDAR_BASE_URL = 'https://www.googleapis.com';\nconst calendarId = 'primary';\nconst eventId = classified.calendarEventId;\n\nlet body;\nif (classified.action === 'confirmed') {\n  body = { extendedProperties: { private: { confirmationStatus: 'confirmed' } } };\n} else {\n  // cancelled -- Google's documented way to cancel an event via the API\n  // is to PATCH its status to \"cancelled\" (not DELETE, which would remove\n  // all history/auditability of the event ever having existed).\n  body = { status: 'cancelled' };\n}\n\nlet url = CALENDAR_BASE_URL + '/calendar/v3/calendars/' + encodeURIComponent(calendarId) + '/events/' + encodeURIComponent(eventId);\n\nreturn [{ json: {\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  action: classified.action,\n  newVersion: classified.newVersion,\n  url,\n  requestBody: body,\n} }];\n"
+      }
+    },
+    {
+      "id": "callCalendar",
+      "name": "Call Calendar API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1300,
+        -300
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $json.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.requestBody }}",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "classifyCalendar",
+      "name": "Classify Calendar Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        -620
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// The HTTP Request node is configured with \"Never Error\" + \"Full\n// Response\", so this branch receives every HTTP response regardless of\n// status code -- classifies it into a controlled result. Never forwards\n// the raw response body/headers or any calendar event payload.\n\nconst item = $input.first().json; // { statusCode, headers, body } or a transport-failure marker\nconst statusCode = item.statusCode;\n\nconst calendarOk = typeof statusCode === 'number' && statusCode >= 200 && statusCode < 300;\n\nreturn [{ json: {\n  calendarOk,\n  httpStatus: typeof statusCode === 'number' ? statusCode : null,\n} }];\n"
+      }
+    },
+    {
+      "id": "ifCalendarOk",
+      "name": "Calendar Call Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2860,
+        -620
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.calendarOk }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "markInSync",
+      "name": "Mark In Sync",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3120,
+        -780
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Calendar call succeeded: mark the appointment's calendar as in sync and\n-- finalize the reply-event outcome as the action itself, in one\n-- statement -- both updates happen together or not at all.\nWITH sync_update AS (\n  UPDATE appointments SET calendar_sync_status = 'in_sync' WHERE appointment_id = $1 RETURNING appointment_id\n)\nUPDATE reply_events SET result_status = $2 WHERE reply_event_id = $3 RETURNING reply_event_id;\n",
+        "options": {
+          "queryReplacement": "={{ [$('Classify Update Result').item.json.appointmentId, $('Classify Update Result').item.json.action, $('Classify Update Result').item.json.replyEventId] }}"
+        }
+      }
+    },
+    {
+      "id": "buildSuccess",
+      "name": "Build Success Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3380,
+        -780
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only after BOTH the database update AND the calendar mutation\n// succeeded.\n\nconst classified = $('Classify Update Result').first().json;\nconst calResult = $('Classify Calendar Result').first().json;\n\nreturn [{ json: {\n  status: classified.action, // 'confirmed' | 'cancelled'\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  version: classified.newVersion,\n  httpStatus: calResult.httpStatus,\n} }];\n"
+      }
+    },
+    {
+      "id": "markCalendarFailed",
+      "name": "Mark Calendar Sync Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3120,
+        -460
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Postgres and Google Calendar cannot be joined into one atomic\n-- transaction -- the database write already committed durably before this\n-- point. A calendar failure AFTER that point is recorded honestly as\n-- calendar_sync_failed / manual intervention required. It is NEVER\n-- reported as full success, and the database is NOT rolled back (rolling\n-- back would silently discard a customer's already-durable confirmation\n-- or cancellation decision, which is worse than a flagged sync gap).\nWITH sync_update AS (\n  UPDATE appointments SET calendar_sync_status = 'calendar_sync_failed' WHERE appointment_id = $1 RETURNING appointment_id\n)\nUPDATE reply_events SET result_status = 'calendar_sync_failed' WHERE reply_event_id = $2 RETURNING reply_event_id;\n",
+        "options": {
+          "queryReplacement": "={{ [$('Classify Update Result').item.json.appointmentId, $('Classify Update Result').item.json.replyEventId] }}"
+        }
+      }
+    },
+    {
+      "id": "buildCalendarFailed",
+      "name": "Build Calendar Sync Failed Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3380,
+        -460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached when the database update succeeded but the calendar mutation\n// did not. Never reports false success -- status is always\n// \"calendar_sync_failed\", distinct from \"confirmed\"/\"cancelled\", so a\n// caller cannot mistake this for a fully successful outcome.\n\nconst classified = $('Classify Update Result').first().json;\nconst calResult = $('Classify Calendar Result').first().json;\n\nreturn [{ json: {\n  status: 'calendar_sync_failed',\n  replyEventId: classified.replyEventId,\n  appointmentId: classified.appointmentId,\n  version: classified.newVersion,\n  httpStatus: calResult.httpStatus,\n} }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Reserve Idempotency",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Rejected Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserve Idempotency": {
+      "main": [
+        [
+          {
+            "node": "Reserved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserved?": {
+      "main": [
+        [
+          {
+            "node": "Apply Optimistic Update",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Duplicate Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Optimistic Update": {
+      "main": [
+        [
+          {
+            "node": "Classify Update Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Update Result": {
+      "main": [
+        [
+          {
+            "node": "Updated Successfully?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Updated Successfully?": {
+      "main": [
+        [
+          {
+            "node": "Requires Calendar Mutation?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Non-Update Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Non-Update Outcome": {
+      "main": [
+        [
+          {
+            "node": "Build Update Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Requires Calendar Mutation?": {
+      "main": [
+        [
+          {
+            "node": "Build Calendar Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record No-Calendar Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record No-Calendar Outcome": {
+      "main": [
+        [
+          {
+            "node": "Build No-Calendar Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Calendar Request": {
+      "main": [
+        [
+          {
+            "node": "Call Calendar API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Calendar API": {
+      "main": [
+        [
+          {
+            "node": "Classify Calendar Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify Calendar Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Calendar Result": {
+      "main": [
+        [
+          {
+            "node": "Calendar Call Succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar Call Succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Mark In Sync",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Calendar Sync Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark In Sync": {
+      "main": [
+        [
+          {
+            "node": "Build Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Calendar Sync Failed": {
+      "main": [
+        [
+          {
+            "node": "Build Calendar Sync Failed Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": [],
+  "id": "x2rT4NoXHm6kSmBc"
+}
