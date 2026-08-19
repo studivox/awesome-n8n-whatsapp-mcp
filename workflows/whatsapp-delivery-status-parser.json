@@ -1,0 +1,99 @@
+{
+  "id": "pVeG1kndB9QqjHrC",
+  "name": "WhatsApp Delivery Status Parser",
+  "nodes": [
+    {
+      "id": "0eb6dbb6-a62e-45f7-bf2c-05b23d0eb92e",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        250,
+        380
+      ],
+      "webhookId": "3ef4bad5-3486-4a42-922a-97da91c35c6c",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-delivery-status-parser",
+        "authentication": "none",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "d2398b76-7b0d-449b-b153-f4607f19e143",
+      "name": "Scope Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        180,
+        100
+      ],
+      "parameters": {
+        "content": "## What this is -- and is not\\n\\n- Parses WhatsApp Cloud API delivery-status webhook events (sent/delivered/read/failed) into a small, safe summary. It does **not** store anything, send anything, or update a calendar/database/CRM.\\n- **POST-only.** No Meta GET verification handshake or X-Hub-Signature-256 signature validation is implemented. **Do not expose this directly to Meta without a verified gateway in front of it** -- add signature validation and the GET handshake at that gateway, or you will accept unauthenticated traffic.\\n- Processes only the **first** status event in a payload -- if Meta batches multiple status updates into one webhook call, only the first is parsed.\\n- Every provider-controlled value (message ID, status, timestamp, error code) is bounded and format-checked before use -- oversized or control-character-laden values are rejected or normalized, not trusted as-is.\\n- For a 'failed' status, only a validated, bounded error *code* is returned -- never raw error text or a diagnostic payload.\\n- `providerMessageId` is an opaque identifier that may be linkable to a communication or customer record and must be handled accordingly -- it is not claimed to be free of privacy considerations.",
+        "height": 320,
+        "width": 560
+      }
+    },
+    {
+      "id": "ddaf3d44-122c-438a-be74-c2be659f2301",
+      "name": "Parse Delivery Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Parse a WhatsApp Business Cloud API delivery-status webhook event.\n//\n// This node NEVER returns recipient phone numbers, message content, or the\n// raw webhook payload. It stores nothing and sends nothing -- it only\n// extracts a small, safe status summary. Only the FIRST status event in the\n// payload is processed if more than one is present (see documentation).\n//\n// Every provider-controlled value is bounded and format-checked before use:\n// an opaque identifier being \"just a string\" does not make it safe to pass\n// through unchecked -- oversized or control-character-laden values are\n// rejected/normalized rather than trusted.\n\nconst item = $input.first().json;\nconst payload = item.body !== undefined ? item.body : item;\n\nfunction safeGet(obj, path, fallback) {\n  try {\n    let cur = obj;\n    for (const key of path) {\n      if (cur === null || cur === undefined) return fallback;\n      cur = cur[key];\n    }\n    return cur === undefined ? fallback : cur;\n  } catch (e) {\n    return fallback;\n  }\n}\n\n// Opaque Meta message IDs look like \"wamid.<base64-ish>\" -- bound the length\n// and restrict to the characters realistically used (letters, digits, and\n// the handful of punctuation characters base64/URL-safe encodings use).\nfunction isValidProviderMessageId(v) {\n  return typeof v === 'string' && /^[A-Za-z0-9._=+\\/-]{1,256}$/.test(v);\n}\n\nconst KNOWN_STATUSES = ['sent', 'delivered', 'read', 'failed'];\nfunction isKnownStatus(v) {\n  return KNOWN_STATUSES.includes(v);\n}\n// A future, currently-unknown status value is only ever passed through if it\n// looks like a safe status token: lowercase letters/underscores, bounded\n// length. Anything else (control characters, oversized, mixed case, etc.)\n// becomes the literal string \"unknown\" instead.\nfunction isSafeUnknownStatusToken(v) {\n  return typeof v === 'string' && /^[a-z_]{1,32}$/.test(v);\n}\n\n// Only a bounded, digits-only Unix timestamp representation is accepted.\nfunction isValidTimestamp(v) {\n  if (typeof v !== 'string' && typeof v !== 'number') return false;\n  return /^\\d{1,20}$/.test(String(v));\n}\n\n// A provider error code must be a safe 32-bit integer, or a short\n// alphanumeric/underscore/hyphen token -- never arbitrary text, whitespace,\n// or control characters, which could carry diagnostic detail we must never\n// return.\nconst INT32_BOUND = 2 ** 31;\nfunction isValidErrorCode(v) {\n  if (typeof v === 'number') return Number.isInteger(v) && Math.abs(v) < INT32_BOUND;\n  if (typeof v === 'string') return /^[A-Za-z0-9_-]{1,64}$/.test(v);\n  return false;\n}\n\nconst IGNORED = { providerMessageId: null, deliveryStatus: null, eventTimestamp: null, errorCode: null, processingStatus: 'ignored' };\n\nlet result;\n\ntry {\n  if (!payload || typeof payload !== 'object') {\n    result = IGNORED;\n  } else {\n    const entry = safeGet(payload, ['entry', 0], null);\n    const change = entry ? safeGet(entry, ['changes', 0], null) : null;\n    const value = change ? safeGet(change, ['value'], null) : null;\n\n    if (!value) {\n      result = IGNORED;\n    } else {\n      const statuses = Array.isArray(value.statuses) ? value.statuses : [];\n\n      if (statuses.length === 0) {\n        result = IGNORED;\n      } else {\n        // Process only the first status event; any additional entries in\n        // this payload are intentionally not processed (see documentation).\n        const first = statuses[0];\n        const rawId = first.id;\n\n        if (!isValidProviderMessageId(rawId)) {\n          // An invalid or oversized ID means we cannot trust this event\n          // enough to report anything about it at all.\n          result = IGNORED;\n        } else {\n          const providerMessageId = rawId;\n          const rawStatus = first.status;\n\n          let deliveryStatus;\n          if (isKnownStatus(rawStatus) || isSafeUnknownStatusToken(rawStatus)) {\n            deliveryStatus = rawStatus;\n          } else {\n            deliveryStatus = 'unknown';\n          }\n\n          const eventTimestamp = isValidTimestamp(first.timestamp) ? String(first.timestamp) : null;\n\n          let errorCode = null;\n          if (deliveryStatus === 'failed') {\n            const code = safeGet(first, ['errors', 0, 'code'], null);\n            errorCode = isValidErrorCode(code) ? code : null;\n          }\n\n          result = { providerMessageId, deliveryStatus, eventTimestamp, errorCode, processingStatus: 'parsed' };\n        }\n      }\n    }\n  }\n} catch (err) {\n  result = IGNORED;\n}\n\nreturn [{ json: result }];\n"
+      }
+    },
+    {
+      "id": "4bf3363c-b55e-4594-85d6-16541387e428",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        800,
+        380
+      ],
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Delivery Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Delivery Status": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": []
+}
