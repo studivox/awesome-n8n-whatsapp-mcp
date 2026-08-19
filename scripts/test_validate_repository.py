@@ -125,5 +125,91 @@ class TestPlaceholderDetection(unittest.TestCase):
         self.assertFalse(vr.is_placeholder(realistic))
 
 
+def _workflow_with_commitment(value):
+    return {
+        "nodes": [
+            {
+                "name": "Evaluate GET Verification",
+                "type": "n8n-nodes-base.code",
+                "parameters": {
+                    "jsCode": f"const EXPECTED_COMMITMENT = '{value}';\nreturn [];\n",
+                },
+            }
+        ],
+    }
+
+
+class TestCommitmentPlaceholderEnforcement(unittest.TestCase):
+    def test_approved_placeholder_passes(self):
+        data = _workflow_with_commitment(vr.APPROVED_COMMITMENT_PLACEHOLDER)
+        report = vr.Report()
+        vr.validate_commitment_placeholders("test.json", data, report)
+        self.assertEqual(report.errors, [], f"unexpected findings: {report.errors}")
+
+    def test_realistic_64_hex_commitment_rejected(self):
+        # Shape of a real HMAC-SHA256 hex digest -- exactly what must never
+        # ship in the distributable workflow in place of the placeholder.
+        fake_real_commitment = "".join(
+            "0123456789abcdef"[i % 16] for i in range(64)
+        )
+        data = _workflow_with_commitment(fake_real_commitment)
+        report = vr.Report()
+        vr.validate_commitment_placeholders("test.json", data, report)
+        self.assertTrue(
+            any("EXPECTED_COMMITMENT" in e and "64-character hex" in e for e in report.errors),
+            f"expected a real-commitment finding, got: {report.errors}",
+        )
+
+    def test_other_unexpected_value_rejected(self):
+        data = _workflow_with_commitment("TODO_FIX_LATER")
+        report = vr.Report()
+        vr.validate_commitment_placeholders("test.json", data, report)
+        self.assertTrue(
+            any("EXPECTED_COMMITMENT" in e for e in report.errors),
+            f"expected an unexpected-value finding, got: {report.errors}",
+        )
+
+    def test_uppercase_hex_commitment_still_rejected_as_unexpected(self):
+        # Not a valid commitment shape (commitments are documented as
+        # lowercase hex) and not the placeholder -- must still fail, not be
+        # silently accepted as "close enough".
+        almost_real = ("A1" * 32)
+        data = _workflow_with_commitment(almost_real)
+        report = vr.Report()
+        vr.validate_commitment_placeholders("test.json", data, report)
+        self.assertTrue(
+            any("EXPECTED_COMMITMENT" in e for e in report.errors),
+            f"expected a finding for non-lowercase-hex value, got: {report.errors}",
+        )
+
+    def test_no_commitment_assignment_present_is_not_an_error(self):
+        data = {
+            "nodes": [
+                {
+                    "name": "Unrelated Code Node",
+                    "type": "n8n-nodes-base.code",
+                    "parameters": {"jsCode": "return [];\n"},
+                }
+            ],
+        }
+        report = vr.Report()
+        vr.validate_commitment_placeholders("test.json", data, report)
+        self.assertEqual(report.errors, [])
+
+    def test_current_repository_gateway_workflow_ships_only_approved_placeholder(self):
+        # End-to-end guard against the exact failure mode requirement #6
+        # exists to prevent: a real or leftover-from-testing commitment
+        # accidentally committed to the actual distributable file.
+        gateway_path = vr.WORKFLOWS_DIR / "whatsapp-webhook-security-gateway.json"
+        if not gateway_path.exists():
+            self.skipTest("gateway workflow file not present in this checkout")
+        import json
+
+        data = json.loads(gateway_path.read_text(encoding="utf-8"))
+        report = vr.Report()
+        vr.validate_commitment_placeholders(gateway_path, data, report)
+        self.assertEqual(report.errors, [], f"unexpected findings: {report.errors}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
