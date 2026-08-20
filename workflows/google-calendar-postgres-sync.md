@@ -30,7 +30,7 @@ Built and tested against **n8n v2.35.4**, running on Node.js v22.23.2, against a
 | Does a Code node in "Run Once for Each Item" mode behave the way per-item outbox classification needs? | Two corrections found only by testing: (1) `$input.first()/.last()/.all()/.itemMatching()` are explicitly disallowed in that mode — `$json` is the correct per-item accessor. (2) The mode requires returning a bare object (`return { json: {...} }`), not an array. |
 | Does `$('NodeName').first()`, referenced from inside a per-item Code node, correctly correlate to the *current* item? | **No — always the first item of whatever that node produced, not item-correlated,** and this does not trip n8n's each-item-mode validator (only bare `$input.*` is blocked), so it fails silently. Fixed by using `$('NodeName').item.json` (paired-item aware) everywhere a per-item node reaches an upstream per-item node by name. Re-verified with a genuine 2-item batch (distinct `update` + `cancel` operations, different appointments): each item ended up mapped to its own, distinct Calendar event, not cross-contaminated. |
 | Does a Postgres "Execute Query" node's own output silently discard the item's other fields? | Yes — its output is exactly the query's result columns, nothing carried over from the incoming item. Two distinct bugs were caused by this and are documented precisely because they were genuinely shipped and then caught by review, not just anticipated: (1) the calendar-error and aborted terminal responses were being **silently replaced** by the `Release Lease` node's own raw `{out_released}` output, because each path's final node was the lease-release call itself — fixed by adding a `Restore ... Response` node after each release that re-reads the built response by name (`$('Build Calendar Error Response').first().json`). (2) A `RETURNS TABLE(out_ok boolean, ...)` column can be ambiguous even across nested subqueries calling *another* function with the same output column name — `sync_outbox_finalize`'s conflict/failure branches originally did `SELECT (SELECT out_ok FROM sync_outbox_finalize_conflict(...)), p_reason`, and PostgreSQL could not resolve `out_ok` between the outer function's own return-table variable and the inner function's result column, raising `column reference "out_ok" is ambiguous` and aborting the finalize call outright. Fixed by capturing the inner call's result into a local `v_ok` variable first. Both were caught only by executing the real workflow end-to-end against real PostgreSQL, not by any unit test of the SQL alone. |
-| Does the mock Calendar server used for testing implement real Google incremental-sync semantics? | Initially, no — it returned the full unfiltered event set on every `syncToken`-based call regardless of what had actually changed, which silently masked a real correctness question (does this workflow correctly rely on Google's actual sync-token contract, or does it accidentally depend on the mock's over-generous behavior?). Fixed the mock to track a monotonic generation per event and only return events whose generation is newer than the token's issuance point, and to always include cancelled events in incremental results (matching Google's documented deletion-detection behavior) regardless of the `showDeleted` flag. This also revealed that `Build Fetch Params` was not requesting `showDeleted=true` for incremental syncs — fixed; a full/baseline sync intentionally still omits it (avoids pulling an unbounded history of already-cancelled events on the very first sync). |
+| Does the mock Calendar server used for testing implement a realistic incremental-sync model? | Initially, no — it returned the full unfiltered event set on every `syncToken`-based call regardless of what had actually changed, which silently masked a real correctness question (does this workflow's pagination-token and cursor logic actually depend on incremental listings being filtered to genuine changes, or was it accidentally relying on the mock's over-generous behavior?). Fixed the mock to track a monotonic generation per event and only return events whose generation is newer than the token's issuance point, and to always include cancelled events in incremental results regardless of the `showDeleted` flag — this project's understanding is that Google's own sync-token contract works this way, but **the real Google Calendar API was never contacted to verify it directly**, so this is the mock's modeled behavior, not a claim of confirmed provider fact. This also revealed that `Build Fetch Params` was not requesting `showDeleted=true` for incremental syncs — fixed; a full/baseline sync intentionally still omits it (avoids pulling an unbounded history of already-cancelled events on the very first sync). |
 | Can the real Google Calendar API be used for testing? | No — no dedicated synthetic test calendar/credential available. **The real Google Calendar API was never contacted.** All Calendar-dependent testing used a temporary, uncommitted mock-bound copy of this workflow, disclosed here and in [Test procedure](#test-procedure). |
 
 **Feasibility verdict: GO**, with every design and implementation defect above corrected and re-verified before any test was counted as passing.
@@ -59,7 +59,22 @@ Built and tested against **n8n v2.35.4**, running on Node.js v22.23.2, against a
 
 **Expired sync token (`410 Gone`)**: caught, the cursor is reset to a clean full-resync state (`sync_reset_for_full_resync`, itself lease-guarded and idempotent), and the pagination loop restarts as a full sync from the beginning.
 
-**Incremental sync correctness**: verified against a mock server that implements real Google sync-token semantics — a monotonic generation counter per event, with incremental listings filtered to `generation > token's issuance generation`, and cancelled events always included in incremental results regardless of `showDeleted` (matching Google's documented deletion-detection behavior). `showDeleted=true` is explicitly requested on every incremental fetch; a baseline (full) sync intentionally omits it. See [Feasibility investigation](#feasibility-investigation) for how this gap was found and fixed.
+**Incremental sync correctness**: verified against a mock server modeling a sync-token contract this project believes matches Google's real one (a monotonic generation counter per event, incremental listings filtered to `generation > token's issuance generation`, cancelled events always included in incremental results regardless of `showDeleted`) — **not independently verified against the real Google Calendar API**, which was never contacted; see [Feasibility investigation](#feasibility-investigation) for how this modeling gap was found and fixed, and verify against your own real, non-production calendar before relying on it. `showDeleted=true` is explicitly requested on every incremental fetch; a baseline (full) sync intentionally omits it.
+
+### Pagination-token contract
+
+An intermediate page must carry exactly a valid, bounded `nextPageToken` and **no** `nextSyncToken`; a final page must carry exactly a valid, bounded `nextSyncToken` and **no** `nextPageToken`. A page carrying both, or neither, is rejected outright — never guessed at, never treated as "probably the last page" or "probably not." This is enforced at **two independent layers**:
+
+1. **n8n (`Classify Fetch Result`)**, before `Process Page` is ever called: `hasPageToken` and `hasSyncToken` are computed as strict booleans (bounded, non-empty string checks), and the page is only considered valid when exactly one of the two is true (`hasPageToken !== hasSyncToken`).
+2. **PostgreSQL (`sync_process_page`)**, as defense in depth: re-checks that `p_is_final_page` is consistent with which of `p_next_page_token`/`p_next_sync_token` is actually non-`NULL`, rejecting the call (`invalid_token_contract`, cursor untouched) if not.
+
+**A missing or malformed final `nextSyncToken` can never clear the existing cursor, mark the sync complete, or reach the outbox drain** — both layers reject that page before `sync_process_page` (the only thing that ever advances the cursor, or that the graph passes through on the way to `Claim Outbox Batch`) is ever invoked. Verified directly: a page deliberately forced to carry both tokens, and separately a page forced to carry neither, both produce a controlled `calendar_error` with the cursor confirmed byte-identical to its prior value.
+
+**Never an ambiguous incremental request.** If `needs_full_resync = false` but the stored `sync_token` is missing or fails its own bounded-string check, the workflow does not guess at what an incremental request without a real token would mean — it explicitly resets through the exact same full-resync transition used for a `410 Gone` response (`sync_reset_for_full_resync`, via a dedicated `Sync State Consistent?` gate immediately after the lease is acquired) before ever calling `Fetch Events Page`. Verified directly: a calendar seeded with `needs_full_resync = false, sync_token = NULL` (a state this workflow's own logic should never itself produce, but defended against regardless) correctly performed a full sync and left the calendar with a genuine, valid `sync_token` and `needs_full_resync = false` afterward — not stuck, and not sending Google a syncToken-less request under incorrect assumptions about what that means.
+
+### Query-parameter consistency
+
+The exact same stable parameters are used for a full sync and every incremental sync that follows it — `singleEvents=true` and `showDeleted=true`, always — differing **only** in whether `syncToken` (incremental) and `pageToken` (mid-pagination) are present. Nothing about the parameter set ever changes partway through a sync-token chain. This was a deliberate correction: an earlier draft omitted `showDeleted` entirely for full sync and only added it for incremental sync, meaning a token issued under one parameter set could be redeemed under a different one later — never verified as safe, and now eliminated by construction rather than by convention. The mock server used for testing asserts this contract on every request to the general listing endpoint (rejecting with `400` if `singleEvents`/`showDeleted` aren't exactly `'true'`, or if any parameter outside `{singleEvents, showDeleted, syncToken, pageToken}` is present), so any regression in the query-building code fails the test suite immediately rather than silently drifting. Verified directly for a full sync with pagination, a subsequent incremental sync, and a `410`-triggered resync — the exact parameter set on every request was inspected via the mock server's own call log, not inferred from the workflow's reported output.
 
 ## Idempotency pre-check design
 
@@ -87,7 +102,32 @@ For `update` and `cancel`, before the corresponding HTTP call is ever built:
 
 `update` is sent with an `If-Match: <etag>` header. A concurrent Calendar-side edit this workflow doesn't know about makes the etag stale, and Google's conditional-request semantics reject it with `412` — recorded as an explicit `conflict` outcome, never silently overwritten.
 
-**Repeated cancellation — re-tested and corrected.** A prior draft of this documentation claimed cancellation was "naturally idempotent" because repeating a `DELETE` against an already-cancelled event was assumed to be a harmless no-op. That claim was not verified against real Google Calendar API behavior and was wrong: **Google's `events.delete` returns `410 Gone` on a second call against an already-deleted/cancelled event, not another success.** The mock server used for testing was corrected to reproduce this exactly (first `DELETE` on a confirmed event → `204`; a second `DELETE` on that same, now-cancelled event → `410`), and `Classify Mutate Result` was corrected to treat a `410` response **specifically and only for `cancel` operations** as a successful, idempotent outcome — the already-cancelled state *is* the desired end state. This was verified directly: two independent `cancel` outbox operations enqueued against the same appointment both finalized as `applied`, with the mock server's own recorded event state confirming the second `DELETE` genuinely received `410` and was still correctly classified as success. Cancellation is idempotent **because this is explicitly handled**, not because a blind repeat `DELETE` happens to return an identical result.
+**Repeated cancellation — re-tested and corrected.** A prior draft of this documentation claimed cancellation was "naturally idempotent" because repeating a `DELETE` against an already-cancelled event was assumed to be a harmless no-op. That claim was never actually verified — it was an assumption, stated as if it were tested fact. **The real Google Calendar API was never contacted, and this workflow makes no claim about what it actually returns for a repeated `events.delete` call** — that would require a citation to Google's own documentation or direct observation against a real calendar, neither of which this project has. What *was* done: the mock server used for testing was configured to model a plausible worst case — a second `DELETE` against an already-cancelled event returns `410 Gone` rather than another `204` — specifically so this workflow's own handling of that response could be exercised and verified, rather than silently assuming a repeat call is always harmless. `Classify Mutate Result` treats a `410` response **specifically and only for `cancel` operations** as a successful, idempotent outcome — the already-cancelled state *is* the desired end state, whatever status code Calendar happens to return to convey it. Verified directly against the mock: two independent `cancel` outbox operations enqueued against the same appointment both finalized as `applied`, with the mock server's own recorded event state confirming the second `DELETE` received `410` and was still correctly classified as success. Cancellation is idempotent in this design **because both plausible outcomes (`204` or `410`) are explicitly handled as success**, not because of any assumption about what Google's real API does on a repeat call — verify this against your own real, non-production calendar before relying on it.
+
+## Create-input fail-closed design
+
+Before the idempotency lookup ever runs — before any Calendar `GET` at all — a `create` outbox row's own fields are validated and bounded, exactly the same way a `Calendar`-provided event is: this workflow only *drains* `sync_outbox`, it does not enqueue rows into it, so nothing prevents whatever does enqueue rows from writing something malformed.
+
+- `appointmentId`: non-empty JS string, 1–128 chars, `^[A-Za-z0-9_-]+$`.
+- `idempotencyKey`: same shape check.
+- `googleCalendarId` (read from `sync_calendars.google_calendar_id`, not from the outbox row itself — the only one of these four fields not covered by a `sync_outbox` CHECK constraint, since it's a Calendar-provider identifier this schema has no fixed format to constrain it to): non-empty JS string, ≤512 chars.
+- The create `payload`: must be a genuine JSON object (not an array, not a string, not `null`), serialized to at most **8192 bytes**.
+
+Any failure produces a `failure` outcome (`invalid_appointment_id` / `invalid_idempotency_key` / `invalid_calendar_id` / `invalid_payload_shape` / `payload_too_large`) with **zero Calendar `GET` or `POST` calls** — the `Build Idempotency Check Request` node is never reached; a dedicated `Create Input Valid?` gate routes invalid rows directly to a result-building node instead, mirroring the same pattern used for `update`/`cancel` in [Mutation fail-closed design](#mutation-fail-closed-design).
+
+**Database-level CHECK constraints** on `sync_outbox` now enforce the `appointmentId`, `idempotencyKey`, and payload-shape rules (plus `operation` and `status` enums) directly at insert/update time — a stronger guarantee than the workflow-level check, since a genuinely malformed row can no longer exist in the table at all under normal operation:
+
+```sql
+ALTER TABLE sync_outbox
+  ADD CONSTRAINT sync_outbox_operation_check CHECK (operation IN ('create', 'update', 'cancel')),
+  ADD CONSTRAINT sync_outbox_status_check CHECK (status IN ('pending', 'in_flight', 'applied', 'conflict', 'failed')),
+  ADD CONSTRAINT sync_outbox_appointment_id_check CHECK (appointment_id ~ '^[A-Za-z0-9_-]{1,128}$'),
+  ADD CONSTRAINT sync_outbox_idempotency_key_check CHECK (idempotency_key ~ '^[A-Za-z0-9_-]{1,128}$'),
+  ADD CONSTRAINT sync_outbox_calendar_id_check CHECK (length(calendar_id) BETWEEN 1 AND 512),
+  ADD CONSTRAINT sync_outbox_payload_check CHECK (jsonb_typeof(payload) = 'object' AND octet_length(payload::text) <= 8192);
+```
+
+With these constraints in place, four of the five workflow-level checks above (everything except `googleCalendarId`, which isn't a `sync_outbox` column) become unreachable through a normal `INSERT` — the database rejects the row before this workflow ever sees it. The workflow-level code is kept anyway, deliberately, as defense in depth for anything that bypasses the constraint (a bulk load run with constraints temporarily disabled, a future migration tool, a different schema version) — and was verified functionally correct by testing it directly: each constraint was temporarily dropped, a deliberately invalid row inserted, the real workflow run against it (confirming zero Calendar calls and the correct `failure` outcome), and the constraint restored immediately afterward. See [Test procedure](#test-procedure).
 
 ## Data-minimization design
 
@@ -114,7 +154,7 @@ Nothing else from the provider payload — no `summary`, `description`, `locatio
 | Etag | ≤512 chars |
 | `updated` timestamp | ≤64 chars, and must parse as a genuine timestamp (validated inside an exception-safe block — an unparseable value is counted as malformed, never allowed to abort the page) |
 | `appointmentId` marker | 1–128 chars, `^[A-Za-z0-9_-]+$` |
-| Items per page | ≤2500 (Google's own documented maximum) |
+| Items per page | ≤2500 (a conservative bound; not independently verified against Google's current documentation since the real API was never contacted) |
 | `nextPageToken` / `nextSyncToken` | ≤2048 chars |
 
 Any item failing these checks is counted as `malformed` and is **not** stored beyond a minimal `{reason: '...'}` marker in `sync_conflicts.details` — never the offending field's actual value, bounded or not, when the field itself is what's invalid (e.g. an oversized id is never echoed back, even truncated, into the stored conflict). Every per-item code path also runs inside a nested exception-safe block in the PL/pgSQL function: any *unexpected* error for one item (a constraint violation, a coercion failure the explicit checks above didn't anticipate) is caught and counted as malformed, and can never abort the rest of the page.
@@ -204,8 +244,14 @@ Two layers of testing, both required for confidence in a design this concurrency
 | 31 | Cursor unchanged on a rejected/invalid page (against a calendar with a pre-existing, non-null cursor) | Cursor value confirmed byte-identical before and after the rejected page | real n8n execution, direct SQL inspection |
 | 32 | Calendar-error and aborted final response schemas, after lease release | Both confirmed present and correctly shaped; lease confirmed released in Postgres | real n8n execution |
 | 33 | Multi-page pull-sync, `410` recovery, two-item paired-item correctness, repeated cancellation | All re-verified against the corrected graph — see [Mutation fail-closed design](#mutation-fail-closed-design) for the repeated-cancellation result specifically | real n8n execution |
+| 34 | Pagination-token contract: page carrying both `nextPageToken` and `nextSyncToken` | Controlled `calendar_error`; cursor confirmed unchanged | real n8n execution, direct SQL inspection |
+| 35 | Pagination-token contract: page carrying neither token | Controlled `calendar_error`; cursor confirmed unchanged | real n8n execution, direct SQL inspection |
+| 36 | `needs_full_resync = false` with a missing/invalid stored `sync_token` | Never sends an ambiguous incremental request — resets through the same full-resync transition used for `410 Gone`, then completes a genuine full sync with a valid token afterward | real n8n execution, direct SQL inspection |
+| 37 | Query-parameter consistency across full sync, pagination, incremental sync, and `410` recovery | Every listing request inspected via the mock server's own call log carried exactly `singleEvents=true`, `showDeleted=true`, and only the expected `syncToken`/`pageToken` — never a different parameter set across the same token chain | real n8n execution (mock-server call-log inspection, not workflow-reported output) |
+| 38 | Create-input validation: empty `appointmentId`, oversized `idempotencyKey`, wrong-type payload (array), oversized payload, oversized `googleCalendarId` | Each produces a `failure` outcome with **zero** idempotency-lookup `GET` calls | real n8n execution |
+| 39 | `sync_outbox` CHECK constraints reject invalid `operation`, `status`, `appointment_id` (path-traversal-shaped value), empty `idempotency_key`, and array-shaped `payload` | Every case rejected at `INSERT` time with the expected constraint name in the error | direct SQL |
 
-All 27 direct-SQL scenarios and all 26 real-n8n-execution scenarios pass (53 total; several SQL scenarios and n8n scenarios cover the same requirement from each layer, counted individually above).
+All 27 direct-SQL scenarios and all 42 real-n8n-execution scenarios pass (69 total; several SQL scenarios and n8n scenarios cover the same requirement from each layer, counted individually above).
 
 ## Clean re-import results
 
@@ -217,10 +263,10 @@ All 27 direct-SQL scenarios and all 26 real-n8n-execution scenarios pass (53 tot
 
 - **Execute Workflow Trigger** (`n8n-nodes-base.executeWorkflowTrigger`, v1.2) — entry point; single input field, `syncCalendarId`.
 - **Sticky Note** (`n8n-nodes-base.stickyNote`, v1) — in-canvas scope note; not part of execution.
-- **Code** (`n8n-nodes-base.code`, v2) — used **twenty-five** times: input validation, page-state initialization and accumulation, fetch/finalize classification and response restoration, and per-item outbox classification, idempotency decision-making, and mutate-request validation (see [Feasibility investigation](#feasibility-investigation) for the two n8n-specific each-item-mode behaviors this design accounts for).
-- **IF** (`n8n-nodes-base.if`, v2.2) — used **twelve** times, gating every mutation and every loop-continuation decision structurally: input validity, lease acquisition, HTTP success + page-shape validity, expired-token detection, page-apply success, final-page detection, whether there's outbox work at all, create-vs-mutate-vs-invalid-operation routing, whether the idempotency lookup found a genuinely usable match, and whether a mutate request passes its own pre-flight validation.
+- **Code** (`n8n-nodes-base.code`, v2) — used **twenty-eight** times: input validation, sync-state consistency, page-state initialization and accumulation, fetch/finalize classification and response restoration, create-input validation, and per-item outbox classification, idempotency decision-making, and mutate-request validation (see [Feasibility investigation](#feasibility-investigation) for the two n8n-specific each-item-mode behaviors this design accounts for).
+- **IF** (`n8n-nodes-base.if`, v2.2) — used **fourteen** times, gating every mutation and every loop-continuation decision structurally: input validity, lease acquisition, sync-state consistency (never an ambiguous incremental request), HTTP success + page-shape + pagination-token-contract validity, expired-token detection, page-apply success, final-page detection, whether there's outbox work at all, create-vs-mutate-vs-invalid-operation routing, whether create-input passes its own pre-flight validation, whether the idempotency lookup found a genuinely usable match, and whether a mutate request passes its own pre-flight validation.
 - **Merge** (`n8n-nodes-base.merge`, v3, append mode) — used **two** times, to reconverge the create/mutate/invalid-operation outbox branches before a shared finalize step, and to reconverge the "no outbox work" path with the finalized-work path before the final summary.
-- **Postgres** (`n8n-nodes-base.postgres`, v2.6) — used **eight** times, `Execute Query` operation, every query fully parameterized. Each call is a single, self-contained function invocation (see [Schema](#schema)).
+- **Postgres** (`n8n-nodes-base.postgres`, v2.6) — used **nine** times, `Execute Query` operation, every query fully parameterized. Each call is a single, self-contained function invocation (see [Schema](#schema)).
 - **HTTP Request** (`n8n-nodes-base.httpRequest`, v4.2) — used **four** times (fetch events page, idempotency pre-check, create event, mutate event), each with `Never Error` + `Full Response` + `onError: continueErrorOutput`, so HTTP-status failures and transport-level failures both route to controlled classification instead of crashing the execution.
 
 All node types are part of n8n core — no community nodes required, and nothing here requires an n8n Enterprise-licensed feature.
@@ -231,7 +277,7 @@ All node types are part of n8n core — no community nodes required, and nothing
 
 | Credential | Bound to node(s) | Type |
 |---|---|---|
-| e.g. "Sync Postgres" | `Acquire Lease`, `Reset For Full Resync`, `Process Page`, `Release Lease (Error)`, `Release Lease (Aborted)`, `Claim Outbox Batch`, `Finalize Outbox Item`, `Release Lease (Success)` | n8n **Postgres** credential (`postgres`), pointed at your own database with the schema and functions in [Schema](#schema) |
+| e.g. "Sync Postgres" | `Acquire Lease`, `Reset For Full Resync (Startup)`, `Reset For Full Resync`, `Process Page`, `Release Lease (Error)`, `Release Lease (Aborted)`, `Claim Outbox Batch`, `Finalize Outbox Item`, `Release Lease (Success)` | n8n **Postgres** credential (`postgres`), pointed at your own database with the schema and functions in [Schema](#schema) |
 | e.g. "Calendar Access" | `Fetch Events Page`, `Check Existing Event`, `Create Event`, `Mutate Event` | n8n **Google Calendar OAuth2 API** credential (`googleCalendarOAuth2Api`) — set up your own Google Cloud OAuth2 app exactly as you would for n8n's native Google Calendar node |
 
 ## Environment variables
@@ -294,11 +340,20 @@ CREATE TABLE sync_outbox (
   last_error         TEXT,
   google_event_id    TEXT,
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT sync_outbox_operation_check CHECK (operation IN ('create', 'update', 'cancel')),
+  CONSTRAINT sync_outbox_status_check CHECK (status IN ('pending', 'in_flight', 'applied', 'conflict', 'failed')),
+  CONSTRAINT sync_outbox_appointment_id_check CHECK (appointment_id ~ '^[A-Za-z0-9_-]{1,128}$'),
+  CONSTRAINT sync_outbox_idempotency_key_check CHECK (idempotency_key ~ '^[A-Za-z0-9_-]{1,128}$'),
+  CONSTRAINT sync_outbox_calendar_id_check CHECK (length(calendar_id) BETWEEN 1 AND 512),
+  CONSTRAINT sync_outbox_payload_check CHECK (jsonb_typeof(payload) = 'object' AND octet_length(payload::text) <= 8192)
 );
 -- This workflow only DRAINS this table -- something else (e.g. the
 -- confirmation/cancellation workflow) must INSERT rows into it. See
--- Outbox and reconciliation design above.
+-- Outbox and reconciliation design above. The CHECK constraints are the
+-- PRIMARY enforcement point for operation/status/identifier/payload
+-- validity -- see Create-input fail-closed design above for why the
+-- workflow also re-validates these itself as defense in depth.
 
 CREATE TABLE sync_conflicts (
   id             BIGSERIAL PRIMARY KEY,
@@ -580,6 +635,27 @@ BEGIN
     RETURN;
   END IF;
 
+  -- Pagination-token contract: a final page carries exactly
+  -- next_sync_token (no next_page_token); an intermediate page carries
+  -- exactly next_page_token (no next_sync_token). Both present, or
+  -- neither present, is rejected outright -- this mirrors the check
+  -- n8n already performs before this function is ever called, applied
+  -- again here as defense in depth. A missing/malformed final
+  -- next_sync_token can therefore never clear the cursor, mark the
+  -- sync complete, or reach the outbox drain, because this function
+  -- (the only thing that ever advances the cursor) refuses to run.
+  IF p_is_final_page THEN
+    IF p_next_sync_token IS NULL OR p_next_page_token IS NOT NULL THEN
+      RETURN QUERY SELECT false, 'invalid_token_contract'::TEXT, 0, 0, 0, 0, 0;
+      RETURN;
+    END IF;
+  ELSE
+    IF p_next_page_token IS NULL OR p_next_sync_token IS NOT NULL THEN
+      RETURN QUERY SELECT false, 'invalid_token_contract'::TEXT, 0, 0, 0, 0, 0;
+      RETURN;
+    END IF;
+  END IF;
+
   FOR v_item IN SELECT jsonb_array_elements(p_items) LOOP
     BEGIN
       -- Every per-item code path below is inside this nested block so
@@ -738,10 +814,6 @@ BEGIN
       WHERE m5.appointment_id = v_appt_id AND m5.calendar_id = p_calendar_id;
 
     EXCEPTION WHEN OTHERS THEN
-      -- Defense in depth: any error this far down for one item (a
-      -- constraint violation, an unexpected type coercion failure)
-      -- must not abort the page. Counted as malformed; nothing about
-      -- this specific item is persisted.
       v_malformed := v_malformed + 1;
     END;
   END LOOP;
@@ -790,21 +862,32 @@ $$
 ;
 ```
 
-The ten functions were rewritten in this round to fix the two bugs described in [Feasibility investigation](#feasibility-investigation) (`sync_outbox_finalize`'s ambiguous `out_ok` reference) and to add the bounded, allowlist projection and per-item exception safety described in [Data-minimization design](#data-minimization-design) (`sync_process_page`). Every function follows the pattern established by this repository's other Postgres-backed workflows: `RETURNS TABLE` columns are prefixed (`out_...`) to avoid ambiguity with real table column names inside the function body, and every function always returns exactly one row (or, for the batch-claim function, zero-to-N rows by design, handled on the n8n side via `alwaysOutputData` — see [Feasibility investigation](#feasibility-investigation)).
+The ten functions were rewritten across two correction rounds: the first fixed `sync_outbox_finalize`'s ambiguous `out_ok` reference and added the bounded, allowlist projection and per-item exception safety in `sync_process_page` (see [Feasibility investigation](#feasibility-investigation), [Data-minimization design](#data-minimization-design)); this round added the pagination-token-contract check to `sync_process_page` (see [Pagination-token contract](#pagination-token-contract)). Every function follows the pattern established by this repository's other Postgres-backed workflows: `RETURNS TABLE` columns are prefixed (`out_...`) to avoid ambiguity with real table column names inside the function body, and every function always returns exactly one row (or, for the batch-claim function, zero-to-N rows by design, handled on the n8n side via `alwaysOutputData` — see [Feasibility investigation](#feasibility-investigation)).
 
 ## Migration notes for an existing installation
 
-If you already installed the schema and functions from an earlier round of this workflow, re-run the full function block above (`CREATE OR REPLACE FUNCTION` is safe to re-apply) — no table structure changed, only function bodies. Specifically:
+If you already installed the schema and functions from an earlier round of this workflow, apply the following. `CREATE OR REPLACE FUNCTION` is always safe to re-apply for the function changes; the new CHECK constraints require an explicit `ALTER TABLE`.
 
-- `sync_process_page` gained page-level and per-item validation, bounded projection, and exception-safe per-item handling. Any `sync_conflicts` rows written by the *old* version of this function may contain full raw event payloads rather than the new five-field allowlist — if this matters for your compliance posture, purge or redact pre-existing `sync_conflicts.details` values written before this update.
-- `sync_outbox_finalize` had an ambiguous `out_ok` column reference that made every `conflict`/`failure` outbox finalize call throw a hard Postgres error, aborting the execution rather than resolving the outbox row. If you deployed the earlier version, any execution that ever hit an outbox conflict or failure would have failed the *entire* workflow run rather than continuing — check for unexpectedly-`in_flight` outbox rows and re-run this workflow after upgrading the function.
-- `sync_outbox_finalize_success` now validates the `updated` timestamp in an exception-safe block before casting, instead of letting a malformed value abort the call.
+1. **Re-run the full function block above** — no table structure changed for the function updates themselves, only function bodies.
+   - `sync_process_page` gained page-level and per-item validation, bounded projection, exception-safe per-item handling, and (this round) the pagination-token-contract check. Any `sync_conflicts` rows written by an *older* version of this function may contain full raw event payloads rather than the current five-field allowlist — if this matters for your compliance posture, purge or redact pre-existing `sync_conflicts.details` values written before the data-minimization update.
+   - `sync_outbox_finalize` had an ambiguous `out_ok` column reference that made every `conflict`/`failure` outbox finalize call throw a hard Postgres error, aborting the execution rather than resolving the outbox row. If you deployed that earlier version, check for unexpectedly-`in_flight` outbox rows and re-run this workflow after upgrading the function.
+   - `sync_outbox_finalize_success` now validates the `updated` timestamp in an exception-safe block before casting, instead of letting a malformed value abort the call.
+2. **Add the new `sync_outbox` CHECK constraints** (see [Create-input fail-closed design](#create-input-fail-closed-design) for the full list). Before adding them, check for any existing rows that would violate them (an invalid `operation`, an out-of-range identifier, a non-object or oversized `payload`) — if you have any, either fix or delete those rows first, or add the constraints as `NOT VALID` (skips validating existing rows; still enforced for every new `INSERT`/`UPDATE` from that point on) and reconcile the pre-existing data separately:
+   ```sql
+   ALTER TABLE sync_outbox
+     ADD CONSTRAINT sync_outbox_operation_check CHECK (operation IN ('create', 'update', 'cancel')),
+     ADD CONSTRAINT sync_outbox_status_check CHECK (status IN ('pending', 'in_flight', 'applied', 'conflict', 'failed')),
+     ADD CONSTRAINT sync_outbox_appointment_id_check CHECK (appointment_id ~ '^[A-Za-z0-9_-]{1,128}$'),
+     ADD CONSTRAINT sync_outbox_idempotency_key_check CHECK (idempotency_key ~ '^[A-Za-z0-9_-]{1,128}$'),
+     ADD CONSTRAINT sync_outbox_calendar_id_check CHECK (length(calendar_id) BETWEEN 1 AND 512),
+     ADD CONSTRAINT sync_outbox_payload_check CHECK (jsonb_typeof(payload) = 'object' AND octet_length(payload::text) <= 8192);
+   ```
 
 ## Setup steps
 
 1. Create the schema — see [Schema](#schema). If you already have `appointments` from `whatsapp-appointment-confirmation-cancellation`, skip that table.
 2. Import `google-calendar-postgres-sync.json`.
-3. Create and bind your Postgres credential (see [Required credentials](#required-credentials)) to the eight Postgres nodes listed there.
+3. Create and bind your Postgres credential (see [Required credentials](#required-credentials)) to the nine Postgres nodes listed there.
 4. Create and bind your Google Calendar OAuth2 API credential to the four HTTP Request nodes listed there.
 5. Insert one row into `sync_calendars` per calendar you want synced, with its real `google_calendar_id` (e.g. `primary`, or a shared calendar's address) — this is what `syncCalendarId` will reference. Leave `sync_token`/`pending_page_token` `NULL` and `needs_full_resync` at its default `true`; the first run will do a full sync.
 6. Build whatever enqueues `sync_outbox` rows for appointment changes you want pushed to Calendar (this workflow does not do that itself — see [Outbox and reconciliation design](#outbox-and-reconciliation-design)), and whatever triggers this workflow periodically (a Schedule Trigger calling it via Execute Workflow, once per calendar you're syncing).

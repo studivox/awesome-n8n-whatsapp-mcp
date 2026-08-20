@@ -169,7 +169,68 @@
     },
     {
       "parameters": {
-        "jsCode": "\nconst s = $input.first().json;\nconst qs = { singleEvents: 'true' };\nif (s.isFullSync) {\n  // Baseline sync: deleted events are not needed yet (nothing to\n  // detect a deletion against). showDeleted intentionally omitted\n  // here (false) to avoid pulling an unbounded history of already-\n  // cancelled events on the very first sync.\n  qs.showDeleted = 'false';\n  if (s.pageToken) qs.pageToken = s.pageToken;\n} else {\n  // Incremental sync: showDeleted must be requested explicitly so\n  // deletions since the last sync token are actually returned --\n  // Google does not guarantee tombstones appear in incremental\n  // results otherwise.\n  qs.syncToken = s.syncToken;\n  qs.showDeleted = 'true';\n  if (s.pageToken) qs.pageToken = s.pageToken;\n}\nreturn [{ json: { ...s, qs } }];\n"
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.isFullSync || (typeof $json.syncToken === 'string' && $json.syncToken.length > 0 && $json.syncToken.length <= 2048) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        250
+      ],
+      "id": "sync-state-consistent",
+      "name": "Sync State Consistent?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_reset_for_full_resync($1, $2);",
+        "options": {
+          "queryReplacement": "={{ [$json.syncCalendarId, $json.ownerId] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1300,
+        350
+      ],
+      "id": "reset-for-full-resync-(startup)",
+      "name": "Reset For Full Resync (Startup)"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Never issue an ambiguous incremental request: needs_full_resync was\n// false but the stored sync_token is missing/invalid (unreachable\n// under normal operation given the invariants this workflow itself\n// maintains, but defended against here regardless). Explicitly reset\n// through the same full-resync transition used for a 410 Gone\n// response, rather than guessing at a token.\nconst s = $('Init Page State').first().json;\nreturn [{ json: { ...s, isFullSync: true, pageToken: null, syncToken: null } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        350
+      ],
+      "id": "prepare-full-resync-state-(startup)",
+      "name": "Prepare Full Resync State (Startup)"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst s = $input.first().json;\n// Contract: the SAME stable parameters are used for full and\n// incremental sync, differing only in whether syncToken/pageToken are\n// present -- singleEvents and showDeleted never change between an\n// initial full sync and the incremental syncs that follow it, so the\n// token chain issued by Google is never redeemed against a different\n// parameter set than the one it was issued under.\nconst qs = { singleEvents: 'true', showDeleted: 'true' };\nif (!s.isFullSync) {\n  qs.syncToken = s.syncToken;\n}\nif (s.pageToken) qs.pageToken = s.pageToken;\nreturn [{ json: { ...s, qs } }];\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -214,7 +275,7 @@
     },
     {
       "parameters": {
-        "jsCode": "\nconst resp = $input.first().json;\nconst s = $('Build Fetch Params').first().json;\nconst httpStatus = (resp.statusCode !== undefined) ? resp.statusCode : 'connection_error';\nconst httpOk = httpStatus === 200;\nconst bodyIsObject = httpOk && resp.body !== null && typeof resp.body === 'object' && !Array.isArray(resp.body);\nconst itemsIsArray = bodyIsObject && Array.isArray(resp.body.items);\n\nfunction boundedToken(v) {\n  return (v === undefined || v === null) ? null : ((typeof v === 'string' && v.length > 0 && v.length <= 2048) ? v : 'INVALID');\n}\n\nconst rawNextPageToken = itemsIsArray ? boundedToken(resp.body.nextPageToken) : null;\nconst rawNextSyncToken = itemsIsArray ? boundedToken(resp.body.nextSyncToken) : null;\nconst tokensValid = rawNextPageToken !== 'INVALID' && rawNextSyncToken !== 'INVALID';\nconst itemCountValid = itemsIsArray ? resp.body.items.length <= 2500 : false;\n\nconst pageValid = httpOk && bodyIsObject && itemsIsArray && tokensValid && itemCountValid;\n\nreturn [{ json: {\n  ...s, httpStatus, httpOk, isGone: httpStatus === 410,\n  pageValid,\n  items: pageValid ? resp.body.items : [],\n  nextPageToken: pageValid ? rawNextPageToken : null,\n  nextSyncToken: pageValid ? rawNextSyncToken : null,\n  isFinalPage: pageValid ? !rawNextPageToken : true,\n} }];\n"
+        "jsCode": "\nconst resp = $input.first().json;\nconst s = $('Build Fetch Params').first().json;\nconst httpStatus = (resp.statusCode !== undefined) ? resp.statusCode : 'connection_error';\nconst httpOk = httpStatus === 200;\nconst bodyIsObject = httpOk && resp.body !== null && typeof resp.body === 'object' && !Array.isArray(resp.body);\nconst itemsIsArray = bodyIsObject && Array.isArray(resp.body.items);\n\nfunction boundedToken(v) {\n  return (v === undefined || v === null) ? null : ((typeof v === 'string' && v.length > 0 && v.length <= 2048) ? v : 'INVALID');\n}\n\nconst rawNextPageToken = itemsIsArray ? boundedToken(resp.body.nextPageToken) : null;\nconst rawNextSyncToken = itemsIsArray ? boundedToken(resp.body.nextSyncToken) : null;\nconst tokenFieldsValid = rawNextPageToken !== 'INVALID' && rawNextSyncToken !== 'INVALID';\nconst itemCountValid = itemsIsArray ? resp.body.items.length <= 2500 : false;\n\n// Pagination-token contract: an intermediate page carries exactly\n// nextPageToken (no nextSyncToken); a final page carries exactly\n// nextSyncToken (no nextPageToken). Both present, or neither present,\n// is an invalid page -- rejected outright, never guessed at.\nconst hasPageToken = typeof rawNextPageToken === 'string';\nconst hasSyncToken = typeof rawNextSyncToken === 'string';\nconst exactlyOneToken = hasPageToken !== hasSyncToken;\n\nconst pageValid = httpOk && bodyIsObject && itemsIsArray && tokenFieldsValid && itemCountValid && exactlyOneToken;\n\nreturn [{ json: {\n  ...s, httpStatus, httpOk, isGone: httpStatus === 410,\n  pageValid,\n  items: pageValid ? resp.body.items : [],\n  nextPageToken: (pageValid && hasPageToken) ? rawNextPageToken : null,\n  nextSyncToken: (pageValid && hasSyncToken) ? rawNextSyncToken : null,\n  // A missing/malformed final nextSyncToken (pageValid === false)\n  // must never be treated as \"sync complete\" -- isFinalPage is only\n  // ever true here when the page was genuinely valid AND carried a\n  // real sync token. An invalid page routes to Fetch Ok?'s false\n  // branch regardless of this field, so this value is never actually\n  // consulted for cursor/outbox decisions on an invalid page -- kept\n  // strictly correct anyway rather than relying on that.\n  isFinalPage: pageValid ? hasSyncToken : false,\n} }];\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -633,6 +694,65 @@
       ],
       "id": "build-invalid-operation-result",
       "name": "Build Invalid Operation Result"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst j = $json;\nconst idPattern = /^[A-Za-z0-9_-]+$/;\nconst apptIdValid = typeof j.appointmentId === 'string' && j.appointmentId.length > 0 && j.appointmentId.length <= 128 && idPattern.test(j.appointmentId);\nconst idemKeyValid = typeof j.idempotencyKey === 'string' && j.idempotencyKey.length > 0 && j.idempotencyKey.length <= 128 && idPattern.test(j.idempotencyKey);\nconst calIdValid = typeof j.googleCalendarId === 'string' && j.googleCalendarId.length > 0 && j.googleCalendarId.length <= 512;\nconst payload = j.payload;\nconst payloadIsObject = payload !== null && typeof payload === 'object' && !Array.isArray(payload);\nlet payloadSizeOk = false;\nif (payloadIsObject) {\n  try {\n    payloadSizeOk = JSON.stringify(payload).length <= 8192;\n  } catch (e) {\n    payloadSizeOk = false;\n  }\n}\nlet valid = true, invalidReason = null;\nif (!apptIdValid) { valid = false; invalidReason = 'invalid_appointment_id'; }\nelse if (!idemKeyValid) { valid = false; invalidReason = 'invalid_idempotency_key'; }\nelse if (!calIdValid) { valid = false; invalidReason = 'invalid_calendar_id'; }\nelse if (!payloadIsObject) { valid = false; invalidReason = 'invalid_payload_shape'; }\nelse if (!payloadSizeOk) { valid = false; invalidReason = 'payload_too_large'; }\nreturn { json: { ...j, valid, invalidReason } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2950,
+        400
+      ],
+      "id": "validate-create-input",
+      "name": "Validate Create Input"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2970,
+        400
+      ],
+      "id": "create-input-valid",
+      "name": "Create Input Valid?"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst j = $json;\nreturn { json: {\n  outcome: 'failure', outboxId: j.outboxId, syncCalendarId: j.syncCalendarId, ownerId: j.ownerId,\n  appointmentId: j.appointmentId, operation: j.operation,\n  googleEventId: null, etag: null, updated: null, reason: j.invalidReason, details: null,\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2990,
+        250
+      ],
+      "id": "build-invalid-create-input-result",
+      "name": "Build Invalid Create Input Result"
     },
     {
       "parameters": {
@@ -1118,6 +1238,46 @@
       "main": [
         [
           {
+            "node": "Sync State Consistent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync State Consistent?": {
+      "main": [
+        [
+          {
+            "node": "Build Fetch Params",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reset For Full Resync (Startup)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reset For Full Resync (Startup)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Full Resync State (Startup)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Full Resync State (Startup)": {
+      "main": [
+        [
+          {
             "node": "Build Fetch Params",
             "type": "main",
             "index": 0
@@ -1369,7 +1529,7 @@
       "main": [
         [
           {
-            "node": "Build Idempotency Check Request",
+            "node": "Validate Create Input",
             "type": "main",
             "index": 0
           }
@@ -1377,6 +1537,46 @@
         [
           {
             "node": "Is Mutate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Create Input": {
+      "main": [
+        [
+          {
+            "node": "Create Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Build Idempotency Check Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Invalid Create Input Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Invalid Create Input Result": {
+      "main": [
+        [
+          {
+            "node": "Merge Finalize Inputs",
             "type": "main",
             "index": 0
           }
@@ -1686,5 +1886,5 @@
   "staticData": null,
   "meta": null,
   "tags": [],
-  "id": "G0cjtuLkZkqnpUuD"
+  "id": "9Gq5LTciqEjBBOMC"
 }
