@@ -4,12 +4,12 @@
 
 A reusable **sub-workflow** (Execute Workflow Trigger — meant to be called on a schedule or by an orchestrator, not exposed as a webhook) that keeps one Google Calendar in sync with Postgres, in both directions, without ever letting either side silently overwrite the other:
 
-- **Pull-sync** (Calendar → Postgres): fetches new/changed/cancelled events via `events.list`, paginated, using an incremental sync token when available and falling back to a full resync when the token expires (`410 Gone`) or none exists yet. This direction never mutates an appointment's real content — it only refreshes cached drift-detection metadata (`etag`, `updated`, tombstone state) and raises a controlled conflict when something changed on the Calendar side that Postgres didn't originate.
-- **Outbox drain** (Postgres → Calendar): applies pending `create`/`update`/`cancel` operations queued in `sync_outbox` by whatever mutates an appointment (this workflow does not enqueue outbox rows itself — see [Outbox and reconciliation design](#outbox-and-reconciliation-design)). Creates are idempotency-checked before ever calling `POST`; updates are conditional (`If-Match`) so a Calendar-side edit this workflow doesn't know about is rejected as a conflict, never blindly overwritten.
+- **Pull-sync** (Calendar → Postgres): fetches new/changed/cancelled events via `events.list`, paginated, using an incremental sync token when available and falling back to a full resync when the token expires (`410 Gone`) or none exists yet. This direction never mutates an appointment's real content — it only refreshes cached drift-detection metadata (a strict, bounded, five-field allowlist projected from each event — see [Data-minimization design](#data-minimization-design)) and raises a controlled conflict when something changed on the Calendar side that Postgres didn't originate. Every provider-controlled field is validated and bounded before it is ever cast, stored, or used to build a URL — see [Provider-response validation](#provider-response-validation).
+- **Outbox drain** (Postgres → Calendar): applies pending `create`/`update`/`cancel` operations queued in `sync_outbox` by whatever mutates an appointment (this workflow does not enqueue outbox rows itself — see [Outbox and reconciliation design](#outbox-and-reconciliation-design)). Every path fails closed: a failed or malformed idempotency lookup makes **zero** `POST` calls (see [Idempotency pre-check design](#idempotency-pre-check-design)); an `update`/`cancel` with a missing, invalid, or unbounded event id or etag makes **zero** HTTP calls of any kind (see [Mutation fail-closed design](#mutation-fail-closed-design)); an outbox row carrying anything other than `create`/`update`/`cancel` is rejected before any HTTP call is even considered.
 
 It accepts exactly one input: `syncCalendarId`, an **internal id** referencing a row in the `sync_calendars` table. **The real Google Calendar id is never a caller input** — it's read exclusively from that row, so arbitrary caller-supplied data can never redirect a Calendar API call to a calendar this deployment doesn't own. The Calendar API host is fixed (`https://www.googleapis.com/calendar/v3`).
 
-A single row-based **lease** (not `pg_advisory_lock` — see [Cursor, locking, and pagination design](#cursor-locking-and-pagination-design) for why) ensures only one runner touches a given calendar's pull-sync *and* outbox drain at a time, and self-heals on a fixed TTL if a runner crashes without releasing it.
+A single row-based **lease** (not `pg_advisory_lock` — see [Feasibility investigation](#feasibility-investigation) for why) ensures only one runner touches a given calendar's pull-sync *and* outbox drain at a time, and self-heals on a fixed TTL if a runner crashes without releasing it.
 
 ## Real business use case
 
@@ -23,127 +23,204 @@ Built and tested against **n8n v2.35.4**, running on Node.js v22.23.2, against a
 
 | Question | Finding |
 |---|---|
-| Can a Postgres-node-based lease survive n8n's connection pooling? | **Central finding.** n8n's Postgres node checks a client out of a pool per query and returns it after — it does not guarantee the same physical session across separate node calls in one execution. Empirically, sequential Postgres-node calls within one execution consistently reused the same backend pid, even under 5-way concurrent load (verified via `pg_backend_pid()` probes) — but this is undocumented pooling behavior, not a guaranteed contract, and even if it held, a session-scoped `pg_advisory_lock` only releases when *that* session disconnects, which a crashed runner would leave leaked until the pool eventually recycles the connection. A row-based lease (ordinary compare-and-set `UPDATE`s) has no connection-affinity dependency and self-heals on a fixed TTL regardless of how a runner died. Used the lease design. |
-| Does n8n support the open-ended "keep fetching while there's a next page token" loop this design needs? | Yes — verified directly: a cyclic back-edge connection (an IF node's "true" output wired back to an earlier node) executes correctly across multiple passes, with node state correctly correlating to the *current* iteration (not always the first) when referenced by name from a later node in the same loop. Confirmed with an explicit counter test (loop ran exactly 3 times, accumulated `[1,2,3]`) before relying on it for pagination. |
-| Does a zero-row Postgres result matter for n8n's execution model here too? | Yes, same finding as prior workflows in this repository — zero rows means zero items means every downstream node is silently skipped. The outbox claim step can legitimately return 0..N rows (a real per-item fan-out, not a fixed single-row status check), so `alwaysOutputData: true` is set on that node specifically — verified experimentally that this makes it emit exactly one empty placeholder item on a zero-row result, letting the very next node distinguish "nothing claimed" from "N items claimed" instead of silently not running at all. |
-| Does one HTTP Request node support per-item, expression-driven method/URL/body? | Yes — confirmed from n8n's own HTTP Request node source: the method parameter is read via `getNodeParameter('method', itemIndex)`, the same per-item resolution as every other parameter. This let one node handle both `update` (`PATCH`) and `cancel` (`DELETE`) per claimed outbox row via an expression, instead of two separate branches. |
-| Does a Code node in "Run Once for Each Item" mode behave the way this design's per-item outbox classification needs? | Partially as expected, with two corrections found only by testing: (1) `$input.first()/.last()/.all()/.itemMatching()` are explicitly disallowed in that mode (n8n throws before running the code) — `$json` is the correct per-item accessor. (2) The mode requires returning a bare object (`return { json: {...} }`), not an array — returning an array throws `A 'json' property isn't an object`. Both were caught by execution errors during testing and fixed; see [Test procedure](#test-procedure). |
-| Does `$('NodeName').first()`, referenced from inside a per-item Code node, correctly correlate to the *current* item, or always item 0? | **Always the first item of whatever that node produced — not item-correlated.** This does not trip n8n's each-item-mode validator (only bare `$input.*` is blocked), so it fails silently rather than throwing. Confirmed via a genuine 2-item batch (one `update`, one `cancel` outbox row, targeting different appointments): with `.first()`, both items' finalize calls would have used the *first* item's identifiers. Fixed by using `$('NodeName').item.json` (paired-item aware) everywhere a per-item node needs to reach an upstream per-item node by name. Re-verified with the same 2-item batch: each item ended up mapped to its own, distinct Calendar event, not cross-contaminated. |
-| Does a Postgres "Execute Query" node's own output silently discard the item's other fields? | Yes, confirmed repeatedly — its output is exactly the query's result columns, nothing carried over from the incoming item. Every node downstream of a Postgres call in this workflow that also needs earlier context (e.g. the finalize step's `outcome` field, needed for the final summary) reaches back to the pre-Postgres node by name rather than assuming the Postgres node's own output still has it. This is the same category of finding documented in this repository's other Postgres-backed workflows, now also confirmed for a genuinely branching, multi-item graph. |
-| Can the real Google Calendar API be used for testing? | No — this project has no dedicated synthetic test calendar or credential available. Per this repository's testing policy, **the real Google Calendar API was never contacted.** All Calendar-dependent testing used a temporary, uncommitted mock-bound copy of this workflow (identical to the committed file except the Calendar host points at a local mock HTTP server and the credential is a synthetic one), disclosed here and in every relevant results section below. |
+| Can a Postgres-node-based lease survive n8n's connection pooling? | **Central finding.** n8n's Postgres node checks a client out of a pool per query and returns it after — it does not guarantee the same physical session across separate node calls in one execution. A row-based lease (ordinary compare-and-set `UPDATE`s) has no connection-affinity dependency and self-heals on a fixed TTL. Used the lease design. |
+| Does n8n support the open-ended "keep fetching while there's a next page token" loop this design needs? | Yes — verified directly with a cyclic back-edge connection, node state correctly correlating to the *current* iteration. |
+| Does a zero-row Postgres result matter for n8n's execution model here too? | Yes — `alwaysOutputData: true` on the outbox-claim node, verified experimentally, lets the next node distinguish "0 claimed" from "N claimed" instead of being silently skipped. |
+| Does one HTTP Request node support per-item, expression-driven method/URL/body? | Yes — confirmed from n8n's own source (`getNodeParameter('method', itemIndex)`). |
+| Does a Code node in "Run Once for Each Item" mode behave the way per-item outbox classification needs? | Two corrections found only by testing: (1) `$input.first()/.last()/.all()/.itemMatching()` are explicitly disallowed in that mode — `$json` is the correct per-item accessor. (2) The mode requires returning a bare object (`return { json: {...} }`), not an array. |
+| Does `$('NodeName').first()`, referenced from inside a per-item Code node, correctly correlate to the *current* item? | **No — always the first item of whatever that node produced, not item-correlated,** and this does not trip n8n's each-item-mode validator (only bare `$input.*` is blocked), so it fails silently. Fixed by using `$('NodeName').item.json` (paired-item aware) everywhere a per-item node reaches an upstream per-item node by name. Re-verified with a genuine 2-item batch (distinct `update` + `cancel` operations, different appointments): each item ended up mapped to its own, distinct Calendar event, not cross-contaminated. |
+| Does a Postgres "Execute Query" node's own output silently discard the item's other fields? | Yes — its output is exactly the query's result columns, nothing carried over from the incoming item. Two distinct bugs were caused by this and are documented precisely because they were genuinely shipped and then caught by review, not just anticipated: (1) the calendar-error and aborted terminal responses were being **silently replaced** by the `Release Lease` node's own raw `{out_released}` output, because each path's final node was the lease-release call itself — fixed by adding a `Restore ... Response` node after each release that re-reads the built response by name (`$('Build Calendar Error Response').first().json`). (2) A `RETURNS TABLE(out_ok boolean, ...)` column can be ambiguous even across nested subqueries calling *another* function with the same output column name — `sync_outbox_finalize`'s conflict/failure branches originally did `SELECT (SELECT out_ok FROM sync_outbox_finalize_conflict(...)), p_reason`, and PostgreSQL could not resolve `out_ok` between the outer function's own return-table variable and the inner function's result column, raising `column reference "out_ok" is ambiguous` and aborting the finalize call outright. Fixed by capturing the inner call's result into a local `v_ok` variable first. Both were caught only by executing the real workflow end-to-end against real PostgreSQL, not by any unit test of the SQL alone. |
+| Does the mock Calendar server used for testing implement real Google incremental-sync semantics? | Initially, no — it returned the full unfiltered event set on every `syncToken`-based call regardless of what had actually changed, which silently masked a real correctness question (does this workflow correctly rely on Google's actual sync-token contract, or does it accidentally depend on the mock's over-generous behavior?). Fixed the mock to track a monotonic generation per event and only return events whose generation is newer than the token's issuance point, and to always include cancelled events in incremental results (matching Google's documented deletion-detection behavior) regardless of the `showDeleted` flag. This also revealed that `Build Fetch Params` was not requesting `showDeleted=true` for incremental syncs — fixed; a full/baseline sync intentionally still omits it (avoids pulling an unbounded history of already-cancelled events on the very first sync). |
+| Can the real Google Calendar API be used for testing? | No — no dedicated synthetic test calendar/credential available. **The real Google Calendar API was never contacted.** All Calendar-dependent testing used a temporary, uncommitted mock-bound copy of this workflow, disclosed here and in [Test procedure](#test-procedure). |
 
-**Feasibility verdict: GO**, with the design corrected per the findings above before any test was counted as passing.
+**Feasibility verdict: GO**, with every design and implementation defect above corrected and re-verified before any test was counted as passing.
 
 ## Synchronization authority and conflict policy
 
 - **Postgres is authoritative for appointment identity and for the appointment ↔ Calendar-event mapping.** The mapping (`appointment_calendar_mappings`) is only ever created two ways: (a) the outbox drain creates a Calendar event and records the mapping it just made, or (b) a pull-sync full resync adopts a *pre-existing* Calendar event for a known appointment — but **only** when that event carries a marker (`extendedProperties.private.appointmentId`) matching a real row already in `appointments`, and only when that appointment doesn't already have a different mapping. An event that isn't marked, or is marked with an appointment id Postgres doesn't recognize, is never adopted — it's recorded as a conflict for a human to resolve.
 - **Never matched by name, title, phone number, or email.** The only identifier ever used to correlate a Calendar event with an appointment is the stable, client-generated `appointmentId` written into `extendedProperties.private` at creation time.
 - **Never a caller-controlled Calendar event id or Calendar id.** `syncCalendarId` (the only caller input) is validated as an opaque internal identifier and used solely as a `WHERE` parameter against `sync_calendars`; the real `google_calendar_id` it resolves to, and every Calendar event id this workflow acts on, come exclusively from that row or from prior Postgres state (`appointment_calendar_mappings.google_event_id`) — never from the trigger's input or from unvalidated Calendar response data used as-is.
-- **Conflicts are never silently resolved in either direction.** Four distinct conflict reasons are recorded in `sync_conflicts`, each requiring a human or a separate reconciliation process to resolve — see the table in [Outbox and reconciliation design](#outbox-and-reconciliation-design):
+- **Conflicts are never silently resolved in either direction.** Distinct conflict reasons are recorded in `sync_conflicts`, each requiring a human or a separate reconciliation process to resolve — see the table in [Outbox and reconciliation design](#outbox-and-reconciliation-design):
   - `unknown_appointment_reference` — a Calendar event's marker references an appointment id Postgres has never heard of.
   - `duplicate_mapping_candidate` — a Calendar event's marker references an appointment that's already mapped to a *different* event.
   - `concurrent_edit` — a mapped event's `etag` changed on the Calendar side without a corresponding outbox push explaining it.
   - `calendar_side_cancellation` — a mapped event was cancelled directly on Calendar, not through the outbox.
   - `missing_from_calendar` — a full resync completed without ever seeing a mapped, non-cancelled event again (it vanished from Calendar's own listing).
   - `appointment_id_mismatch` — an incoming event's marker no longer matches the appointment id this workflow's own mapping recorded for that exact Calendar event id.
+  - `malformed_event` — an incoming event fails bounded/allowlist validation (oversized or wrong-shaped id/etag/status/timestamp/marker) — see [Provider-response validation](#provider-response-validation).
 
 ## Cursor, locking, and pagination design
 
-**Lease, not `pg_advisory_lock`.** See the feasibility table above for why. `sync_calendars` carries `lease_owner`/`lease_expires_at`; acquiring is a single compare-and-set `UPDATE … WHERE lease_owner IS NULL OR lease_expires_at < now()`. A second runner attempting the same calendar while the lease is held gets `lease_busy` immediately — verified to make **zero** Calendar or further Postgres calls in that case.
+**Lease, not `pg_advisory_lock`.** See [Feasibility investigation](#feasibility-investigation) for why. `sync_calendars` carries `lease_owner`/`lease_expires_at`; acquiring is a single compare-and-set `UPDATE … WHERE lease_owner IS NULL OR lease_expires_at < now()`. A second runner attempting the same calendar while the lease is held gets `lease_busy` immediately — verified to make **zero** Calendar or further Postgres calls in that case.
 
 **Durable per-calendar cursor**, also on `sync_calendars`: `sync_token` (Google's incremental token; `NULL` means a full resync is owed), `pending_page_token` (mid-pagination resume point), `needs_full_resync`, `full_sync_started_at` (stamped when a full-resync run begins, used to detect events that vanished from Calendar entirely — see `missing_from_calendar` above).
 
-**Pagination**: each page is applied and the cursor advanced **in the same Postgres statement** (`sync_process_page`) — the durable state after that call is *either* "this page fully applied and the cursor points past it" *or* (on any failure inside that call) "nothing about this page happened and the cursor is exactly where it was." There is no reachable state in between. Verified directly via crash-injection (see [Crash-consistency results](#crash-consistency-results)).
+**Pagination**: each page is applied and the cursor advanced **in the same Postgres statement** (`sync_process_page`) — the durable state after that call is *either* "this page fully applied and the cursor points past it" *or* (on any failure inside that call, or on a page that fails validation before that call is even made — see [Provider-response validation](#provider-response-validation)) "nothing about this page happened and the cursor is exactly where it was." There is no reachable state in between. Verified directly via crash-injection and via deliberately malformed pages.
 
-**Expired sync token (`410 Gone`)**: caught, the cursor is reset to a clean full-resync state (`sync_reset_for_full_resync`, itself lease-guarded and idempotent), and the pagination loop restarts as a full sync from the beginning — verified end-to-end through the real workflow: a token deliberately invalidated mid-test still produced a complete, correct resync including a newly-created event the stale token predated.
+**Expired sync token (`410 Gone`)**: caught, the cursor is reset to a clean full-resync state (`sync_reset_for_full_resync`, itself lease-guarded and idempotent), and the pagination loop restarts as a full sync from the beginning.
 
-**"Advance the cursor only after the complete applicable batch is processed successfully"**: satisfied at the page granularity described above (the unit n8n and the Calendar API bound work to), and re-verified specifically for a *partial-batch* failure via crash injection — see test #19 below.
+**Incremental sync correctness**: verified against a mock server that implements real Google sync-token semantics — a monotonic generation counter per event, with incremental listings filtered to `generation > token's issuance generation`, and cancelled events always included in incremental results regardless of `showDeleted` (matching Google's documented deletion-detection behavior). `showDeleted=true` is explicitly requested on every incremental fetch; a baseline (full) sync intentionally omits it. See [Feasibility investigation](#feasibility-investigation) for how this gap was found and fixed.
+
+## Idempotency pre-check design
+
+Before any `create` ever calls `POST`, the workflow looks up whether an event carrying this outbox row's `idempotencyKey` already exists (`privateExtendedProperty` exact-match query against the Calendar API). The lookup's result is classified into exactly one of five decisions, computed entirely client-side (never trusting the provider's own server-side filter blindly) before any further action is taken:
+
+| Decision | Condition | Result |
+|---|---|---|
+| `lookup_failed` | The lookup HTTP call did not return a genuine `200` with an object body whose `items` field is an array — covers non-2xx status (`401`/`403`/`429`/`500`/…), a transport-level failure or timeout, and a `200` with a malformed body shape | **Failure outcome. Zero `POST` calls.** |
+| `no_match` | The lookup returned zero items | Proceeds to build and send the actual `create` request. |
+| `single_valid_match` | The lookup returned exactly one item, and that item independently passes bounded validation (id present, bounded, allowlisted) **and** its `appointmentId` and `idempotencyKey` markers both exactly match this outbox row's own values | Adopts the existing event — **zero `POST` calls.** |
+| `mismatched_match` | The lookup returned exactly one item, but it fails the bounded/marker check above | **Conflict outcome. Zero `POST` calls, zero mutation.** |
+| `multiple_matches` | The lookup returned more than one item | **Conflict outcome. Zero `POST` calls, zero mutation** — regardless of whether any individual item would itself have validated. |
+
+This is deliberately stricter than trusting Google's own `privateExtendedProperty` server-side filter: the filter is re-verified client-side (id/etag bounds, exact marker match) before an item is ever treated as a genuine match, and any ambiguity (more than one candidate, or a single candidate that doesn't actually match) fails closed into a conflict rather than guessing.
+
+## Mutation fail-closed design
+
+An outbox row's `operation` is strictly validated to be exactly one of `create`, `update`, or `cancel` — anything else (`route: 'invalid_operation'` internally) is rejected as a failure outcome before any HTTP call is even considered, with zero Calendar calls.
+
+For `update` and `cancel`, before the corresponding HTTP call is ever built:
+
+- The database-sourced Calendar event id (`appointment_calendar_mappings.google_event_id`, read at claim time) must be a genuine JavaScript string, non-empty, at most 1024 characters, and match `^[A-Za-z0-9_-]+$`. A JSON `null` (no mapping exists yet) or `undefined` fails this check by **type**, not by string comparison — there is no code path that could ever produce a request to `/events/null` or `/events/undefined`, because the value is never coerced to a string before this check runs.
+- `update` additionally requires a bounded, non-empty etag (same shape check). `cancel` does not require an etag (Google's `DELETE` doesn't take a conditional precondition the same way `PATCH` does in this design).
+- Any failure of the above produces a `conflict` outcome (`missing_or_invalid_event_id` or `missing_or_invalid_etag`) with **zero HTTP calls of any kind** — the `Mutate Event` node is never reached on this path; a dedicated `Mutate Request Valid?` gate routes invalid requests directly to a result-building node instead.
+
+`update` is sent with an `If-Match: <etag>` header. A concurrent Calendar-side edit this workflow doesn't know about makes the etag stale, and Google's conditional-request semantics reject it with `412` — recorded as an explicit `conflict` outcome, never silently overwritten.
+
+**Repeated cancellation — re-tested and corrected.** A prior draft of this documentation claimed cancellation was "naturally idempotent" because repeating a `DELETE` against an already-cancelled event was assumed to be a harmless no-op. That claim was not verified against real Google Calendar API behavior and was wrong: **Google's `events.delete` returns `410 Gone` on a second call against an already-deleted/cancelled event, not another success.** The mock server used for testing was corrected to reproduce this exactly (first `DELETE` on a confirmed event → `204`; a second `DELETE` on that same, now-cancelled event → `410`), and `Classify Mutate Result` was corrected to treat a `410` response **specifically and only for `cancel` operations** as a successful, idempotent outcome — the already-cancelled state *is* the desired end state. This was verified directly: two independent `cancel` outbox operations enqueued against the same appointment both finalized as `applied`, with the mock server's own recorded event state confirming the second `DELETE` genuinely received `410` and was still correctly classified as success. Cancellation is idempotent **because this is explicitly handled**, not because a blind repeat `DELETE` happens to return an identical result.
+
+## Data-minimization design
+
+`sync_process_page` never stores a raw Calendar event. Before anything reaches `sync_conflicts` or `appointment_calendar_mappings`, every event is projected into a strict, five-field allowlist:
+
+```sql
+jsonb_build_object(
+  'event_id', left(v_event_id, 1024),
+  'status', v_status,
+  'etag', CASE WHEN v_etag IS NOT NULL THEN left(v_etag, 512) ELSE NULL END,
+  'updated', v_updated,
+  'appointment_id_marker', v_appt_id
+)
+```
+
+Nothing else from the provider payload — no `summary`, `description`, `location`, `attendees`, attendee emails, `organizer`, `conferenceData`, or `attachments` — is ever read again after this projection is built, let alone persisted. This was verified directly, not just by code inspection: a synthetic event carrying realistic values for every one of those fields (attendee/organizer email addresses, a conference link, an attachment URL, description text) was fed through the real workflow, and every value was confirmed **absent** from every row written to Postgres afterward.
+
+**Explicit size limits**, enforced before any per-item processing and before any Postgres cast:
+
+| Field | Limit |
+|---|---|
+| Event id | 1–1024 chars, `^[A-Za-z0-9_-]+$` |
+| Status | Must be exactly `confirmed`, `cancelled`, or `tentative` |
+| Etag | ≤512 chars |
+| `updated` timestamp | ≤64 chars, and must parse as a genuine timestamp (validated inside an exception-safe block — an unparseable value is counted as malformed, never allowed to abort the page) |
+| `appointmentId` marker | 1–128 chars, `^[A-Za-z0-9_-]+$` |
+| Items per page | ≤2500 (Google's own documented maximum) |
+| `nextPageToken` / `nextSyncToken` | ≤2048 chars |
+
+Any item failing these checks is counted as `malformed` and is **not** stored beyond a minimal `{reason: '...'}` marker in `sync_conflicts.details` — never the offending field's actual value, bounded or not, when the field itself is what's invalid (e.g. an oversized id is never echoed back, even truncated, into the stored conflict). Every per-item code path also runs inside a nested exception-safe block in the PL/pgSQL function: any *unexpected* error for one item (a constraint violation, a coercion failure the explicit checks above didn't anticipate) is caught and counted as malformed, and can never abort the rest of the page.
+
+## Provider-response validation
+
+Two independent, redundant layers validate the shape of everything the Calendar API returns, so a malformed response can never reach a Postgres cast or a URL:
+
+1. **n8n (`Classify Fetch Result`, before `Process Page` is ever called)**: the HTTP status must be exactly `200`; the body must be a genuine JSON object (not an array, not a primitive); `items` must be an array with at most 2500 entries; `nextPageToken`/`nextSyncToken`, if present, must be non-empty strings of at most 2048 characters. **Any failure here routes to a controlled `calendar_error` response and releases the lease — `sync_process_page` is never invoked, and the cursor is provably untouched**, because the only thing that ever advances it is that function call.
+2. **PostgreSQL (`sync_process_page`, defense in depth)**: re-validates that `p_items` is a genuine JSONB array, re-checks the item-count and token-length bounds, and per-item validates every field as described in [Data-minimization design](#data-minimization-design) — in case a future change to the n8n side ever bypasses layer 1.
+
+An invalid page-level response (wrong shape, oversized token, non-array `items`) fails closed at layer 1 and never reaches Postgres at all; an individual malformed *event* within an otherwise-valid page is caught at layer 2, counted as `malformed`, and does not block the rest of the page or the cursor advance for the events that *are* valid.
+
+## Controlled-response preservation
+
+Every terminal path restores its intended response **after** the lease-release Postgres call, rather than ending at that call directly. This matters because a Postgres "Execute Query" node's output is exactly its query's result columns — it does not carry the incoming item's fields forward (see [Feasibility investigation](#feasibility-investigation)). A prior version of this workflow ended the `calendar_error` and `aborted` paths directly at `Release Lease`, so the actual built response (with its `httpStatus`/`reason`, or its abort `reason`) was silently discarded and replaced by the lease-release call's own `{out_released: true}` output. Fixed: `Restore Calendar Error Response` and `Restore Aborted Response` each re-read the earlier, already-built response by name after the corresponding `Release Lease` call completes. Verified directly for every terminal path:
+
+| Path | Verified final response |
+|---|---|
+| `rejected` | `{ status: 'rejected', reason: 'invalid_sync_calendar_id' }` — never touches Postgres. |
+| `lease_busy` | `{ status: 'lease_busy' }` — never touches Postgres beyond the failed acquire attempt. |
+| `calendar_error` | `{ status: 'calendar_error', httpStatus, reason, syncCalendarId, ownerId }`, confirmed present **after** `Release Lease (Error)` runs; lease confirmed released in Postgres directly. |
+| `aborted` | `{ status: 'aborted', reason, syncCalendarId, ownerId }`, same restoration pattern after `Release Lease (Aborted)`. |
+| `ok` (success) | `{ status: 'ok', pull: {...}, outbox: {...} }`, built from `Accumulate Outbox Results` (referenced by name, not by the immediately-preceding `Release Lease (Success)` node's own output). |
 
 ## Outbox and reconciliation design
 
-`sync_outbox` holds `pending` Postgres → Calendar operations; **this workflow only drains it, it does not enqueue rows** — that's the responsibility of whatever mutates an appointment (e.g. the confirmation/cancellation workflow), matching this repository's existing pattern of each package staying scoped to one job. A drained row moves through `pending → in_flight → applied | conflict | failed`. A row stuck `in_flight` past a staleness threshold (a prior runner crashed after claiming it but before finalizing) is safely reclaimable by a later drain — safely *because*:
-
-- **`create`** is idempotency-checked first: before ever calling `POST`, the workflow looks up whether an event carrying this outbox row's `idempotencyKey` already exists (`privateExtendedProperty` exact-match query). If a prior attempt's `POST` actually succeeded but the finalize write never completed (the crash gap), the retry adopts that existing event instead of creating a duplicate. Verified directly: after simulating exactly this crash, a recovery drain made **zero** additional `POST` calls and correctly adopted the already-created event.
-- **`update`** is sent with an `If-Match: <etag>` header set to Postgres's currently-known etag for that mapping. A concurrent Calendar-side edit this workflow doesn't know about makes the etag stale, and Google's conditional-request semantics reject it with `412` — recorded as an explicit `conflict` outcome, never silently overwritten.
-- **`cancel`** (`DELETE`, which Google marks the event cancelled rather than purging it) is naturally idempotent — repeating it against an already-cancelled event is a no-op.
+`sync_outbox` holds `pending` Postgres → Calendar operations; **this workflow only drains it, it does not enqueue rows** — that's the responsibility of whatever mutates an appointment (e.g. the confirmation/cancellation workflow). A drained row moves through `pending → in_flight → applied | conflict | failed`. A row stuck `in_flight` past a staleness threshold (a prior runner crashed after claiming it but before finalizing) is safely reclaimable by a later drain, because every outcome is designed to be safe to retry or to have already been made impossible to reach twice — see [Idempotency pre-check design](#idempotency-pre-check-design) and [Mutation fail-closed design](#mutation-fail-closed-design) above.
 
 Every finalize call (`sync_outbox_finalize`) is lease-guarded the same way the pull-sync writes are, and is a single statement regardless of outcome (success/conflict/failure), so there's one Postgres write path to reason about rather than three.
 
 | Durable state | Meaning | Resolution |
 |---|---|---|
-| `sync_outbox.status = 'pending'`/`'failed'` | Not yet applied, or a prior attempt failed (network, non-2xx, etc.) | Reclaimed automatically by the next drain |
-| `sync_outbox.status = 'in_flight'` past staleness | A runner claimed it and then crashed before finalizing | Reclaimed automatically by a later drain (idempotency-checked for `create`; naturally idempotent for `update`/`cancel`) |
-| `sync_outbox.status = 'conflict'` / `appointment_calendar_mappings.sync_status = 'conflict'` | Calendar rejected the write (etag mismatch) or a pull-sync detected a Calendar-side edit this workflow didn't originate | Requires a human (or a separate, out-of-scope reconciliation workflow) to decide which side is correct |
-| `sync_conflicts` row, any `reason` | See the six reasons listed under [Synchronization authority and conflict policy](#synchronization-authority-and-conflict-policy) | Same — a human decides; this workflow never auto-resolves any of them |
+| `sync_outbox.status = 'pending'`/`'failed'` | Not yet applied, or a prior attempt failed (network, non-2xx, invalid operation, etc.) | Reclaimed automatically by the next drain |
+| `sync_outbox.status = 'in_flight'` past staleness | A runner claimed it and then crashed before finalizing | Reclaimed automatically by a later drain (idempotency-checked for `create`; fail-closed-validated for `update`/`cancel`) |
+| `sync_outbox.status = 'conflict'` / `appointment_calendar_mappings.sync_status = 'conflict'` | Calendar rejected the write (etag mismatch), the idempotency lookup found an ambiguous or mismatched result, the mutate request failed pre-flight validation, or a pull-sync detected a Calendar-side edit this workflow didn't originate | Requires a human (or a separate, out-of-scope reconciliation workflow) to decide which side is correct |
+| `sync_conflicts` row, any `reason` | See [Synchronization authority and conflict policy](#synchronization-authority-and-conflict-policy) | Same — a human decides; this workflow never auto-resolves any of them |
 
-**This workflow never claims atomicity across Postgres and Google Calendar** — it's structurally impossible, and every design choice above (idempotency keys, conditional requests, lease-guarded finalize, staleness-based reclaim) exists specifically to make the *un-atomic* gap between "Calendar call happened" and "Postgres recorded it" safe to retry or safe to leave for reconciliation, never silently wrong.
+**This workflow never claims atomicity across Postgres and Google Calendar** — it's structurally impossible, and every design choice above (idempotency keys, conditional requests, lease-guarded finalize, staleness-based reclaim, fail-closed validation before every mutating call) exists specifically to make the *un-atomic* gap between "Calendar call happened" and "Postgres recorded it" safe to retry or safe to leave for reconciliation, never silently wrong.
 
 ## Crash-consistency results
-
-All crash points below were tested via the same technique this repository has used previously: deliberately interrupting a step (never completing a Postgres write, or injecting a test-only `RAISE EXCEPTION` variant of a function, dropped after use) and inspecting Postgres directly afterward — not trusting the workflow's own returned status as proof.
 
 | Crash point | Result |
 |---|---|
 | Between claiming an outbox row and the Calendar call | Row remains `pending`; never claimed as `in_flight` until an actual claim happens. |
 | Calendar `create` call succeeds, then Postgres becomes unreachable before finalize | Outbox row left `in_flight`, `google_event_id` still `NULL` on that row (finalize never ran) — **not** falsely marked applied. A later drain's idempotency pre-check found the already-created event and adopted it, making zero additional `POST` calls. |
-| A test-only variant of the page-processing function raises immediately after applying item 1 of a 2-item page, before the cursor-advance write | The entire call rolled back: **zero** rows in `appointment_calendar_mappings` for the crashed page, and the cursor (`sync_token`/`pending_page_token`) completely untouched — confirming a partial-batch failure never advances the cursor past unapplied work. |
+| A test-only variant of the page-processing function raises immediately after applying item 1 of a 2-item page, before the cursor-advance write | The entire call rolled back: **zero** rows in `appointment_calendar_mappings` for the crashed page, and the cursor completely untouched. |
+| A page-level response fails validation (invalid `items` shape, oversized token) | `sync_process_page` is never called at all — the cursor is provably untouched because nothing but that function ever advances it. |
 | Postgres unreachable before a run starts | The lease-acquire call fails immediately and loudly; zero Calendar calls occur. |
 | A calendar event carrying an unrecognized or mismatched marker | Never mutates `appointments` or an unrelated mapping — recorded as a conflict, mapping/appointment state left exactly as it was. |
 
 ## Test procedure
 
-Built and verified in an isolated local n8n test environment (the official `n8n` npm package pinned to v2.35.4 under Node.js v22.23.2, isolated `N8N_USER_FOLDER` and SQLite database) against an isolated local **PostgreSQL 16.15** instance (fresh `initdb` cluster, non-default port, synthetic data only). **The real Google Calendar API was never contacted** — every test requiring a Calendar call used a temporary, uncommitted mock-bound copy of this workflow (same graph, Calendar host and credential swapped for a local mock HTTP server), never exported or committed.
+Built and verified in an isolated local n8n test environment (the official `n8n` npm package pinned to v2.35.4 under Node.js v22.23.2, isolated `N8N_USER_FOLDER` and SQLite database) against an isolated local **PostgreSQL 16.15** instance (fresh `initdb` cluster, non-default port, synthetic data only). **The real Google Calendar API was never contacted** — every test requiring a Calendar call used a temporary, uncommitted mock-bound copy of this workflow, never exported or committed.
 
-Two layers of testing were used, both required for confidence in a design this concurrency-sensitive:
+Two layers of testing, both required for confidence in a design this concurrency- and validation-sensitive:
 
-1. **Direct-SQL engine tests** — the exact orchestration logic (lease acquire → paginated pull-sync → outbox drain → lease release) implemented once more in a small Python harness calling the same PL/pgSQL functions and the same mock Calendar server, so the *engine's* correctness could be verified exhaustively and fast, independent of n8n's own execution-model quirks.
-2. **Real n8n workflow tests** — the actual committed graph (or its temporary mock-bound copy), executed through n8n's own REST API, to verify the *wiring* — the two n8n-specific bugs in the table above (each-item-mode return shape, `.first()` not being paired-item-aware) were only found this way, not at the SQL layer.
+1. **Direct-SQL engine tests** (27 scenarios) — the exact orchestration logic implemented once more in a small Python harness calling the same PL/pgSQL functions and the same mock Calendar server.
+2. **Real n8n workflow tests** (26 scenarios) — the actual committed graph (or its temporary mock-bound copy), executed through n8n's own REST API, inspecting Postgres directly and mock-server call counts as evidence rather than relying on the workflow's own reported output alone. This layer is what caught every n8n-execution-specific defect in this round — none of them were visible at the SQL layer.
 
 | # | Scenario | Result | Verified via |
 |---|---|---|---|
-| 1 | Initial full synchronization | All pre-existing, appointment-marked events adopted; cursor set; `needs_full_resync` cleared | both layers |
-| 2 | Incremental synchronization | Only the genuinely new event applied on the next run, using the stored sync token | both layers |
-| 3 | Multiple pages | 7 events across 4 pages (page size 2) all correctly applied, pagination loop ran exactly 4 times | both layers |
+| 1 | Initial full synchronization | All pre-existing, appointment-marked events adopted; cursor set | both layers |
+| 2 | Incremental synchronization | Only the genuinely new event applied, using a real, generation-filtered incremental listing | both layers |
+| 3 | Multiple pages | 7/3 events across multiple pages, pagination loop ran the correct number of times | both layers |
 | 4 | Empty / no-change run | Zero applied, zero errors | both layers |
-| 5 | New mapped event (outbox create) | Event created, mapping recorded with real `google_event_id`/`etag` | both layers |
-| 6 | Updated mapped event (outbox update) | Existing event's summary changed via `PATCH`; mapping's etag refreshed | both layers |
-| 7 | Cancellation / deletion tombstone (outbox cancel) | Event marked `cancelled` on Calendar; mapping's `sync_status` set to `calendar_cancelled` | both layers |
-| 8 | Unknown event without a trusted appointment mapping | Marker references an appointment id `appointments` has never heard of → `unknown_appointment_reference` conflict, zero mutation | both layers |
-| 9 | Missing / malformed mapping metadata | Event with no `appointmentId` marker at all → `unknown_event` conflict, zero mutation | both layers |
-| 10 | Duplicate delivery / replayed page | The exact same page applied twice → second application is a no-op (no duplicate mapping rows) | direct SQL |
-| 11 | Out-of-order event data | A stale-etag page for an already-synced mapping → flagged `conflict`, not blindly accepted as newer truth | direct SQL |
-| 12 | Concurrent sync runners, same calendar | 4 simultaneous runners: exactly 1 succeeds, 3 report `lease_busy`, zero duplicate mappings | direct SQL |
-| 13 | Independent runners, different calendars | Two calendars synced fully concurrently, zero interference | direct SQL |
-| 14 | Postgres/Calendar edit conflict | An event edited directly on Calendar (not via outbox) → next pull-sync detects the etag drift, flags `concurrent_edit`, does not overwrite anything in Postgres | both layers |
-| 15 | Expired sync token, safe resync | Deliberately invalidated token → `410` caught, full resync restarted, all events (including one created after invalidation) correctly present afterward | both layers |
-| 16 | Google 400 / 401 / 403 / 404 / 429 / 500 / timeout | Each handled without crashing the execution; reported as a controlled `calendar_error` with the real status; zero further mutation that run | direct SQL (mock server forced-status control endpoint) |
-| 17 | PostgreSQL unavailable before processing | Lease-acquire fails immediately and loudly | direct SQL |
-| 18 | PostgreSQL unavailable during finalization (crash after Calendar success) | Outbox row left `in_flight`, not falsely applied; a later recovery drain adopted the already-created event via its idempotency key with zero duplicate `POST`s | direct SQL |
-| 19 | Cursor not advancing after a partial batch failure | Crash-injected mid-page: zero partial mapping rows, cursor completely untouched | direct SQL (crash-injection, test-only function variant, dropped after use) |
-| 20 | Zero unauthorized Calendar calls on the lease-busy path | Confirmed via the mock server's own call log: zero calls while a lease was externally held | direct SQL + real n8n execution |
-| — | Multi-page pull-sync through the real committed graph | 3 events across 2 pages, `pages: 2, applied: 3` in the final summary, loop ran exactly twice | real n8n execution |
-| — | Outbox create with idempotency pre-check, through the real committed graph | `claimed: 1, applied: 1`; mapping recorded with the real Calendar-assigned event id | real n8n execution |
-| — | Two distinct outbox items (one update, one cancel, different appointments) in the same batch, through the real committed graph | Both items correctly and *distinctly* applied — the specific bug found in feasibility testing (`.first()` not being item-correlated) is what this test was built to catch, and it did | real n8n execution |
-| — | `410` recovery loop, through the real committed graph | `Fetch Events Page` ran 3 times (1 failed attempt + 2 full-resync pages), `Reset For Full Resync` ran once, all events present afterward | real n8n execution |
-| — | Lease-busy path, through the real committed graph | Execution stopped at `Build Lease Busy Response` after 6 nodes; zero Postgres/Calendar work beyond the initial acquire attempt | real n8n execution |
-| — | Non-410 Calendar error (500), through the real committed graph | `Build Calendar Error Response` → lease released cleanly, zero stuck lease afterward | real n8n execution |
+| 5–7 | Outbox create / update / cancel (happy path) | Event created/updated/cancelled correctly; mapping reflects real Calendar-assigned ids/etags | both layers |
+| 8–9 | Unknown event / missing marker | Flagged, never auto-adopted | both layers |
+| 10 | Duplicate delivery / replayed page | Idempotent — no duplicate mappings | direct SQL |
+| 11 | Out-of-order event data | Stale etag flagged as conflict, not blindly accepted | direct SQL |
+| 12–13 | Concurrent runners (same / different calendars) | Exactly one succeeds on the same calendar; both succeed independently on different calendars | direct SQL |
+| 14 | Postgres/Calendar edit conflict | Detected, not silently overwritten | both layers |
+| 15 | Expired sync token, safe resync | Full resync restarted correctly, including an event created after invalidation | both layers |
+| 16 | Google 400/401/403/404/429/500/timeout (pull-sync) | Each handled without crashing; controlled `calendar_error`; zero further mutation | direct SQL |
+| 17–19 | Postgres unavailable before/during; cursor-not-advanced on crash | All fail loudly/safely with zero partial state | direct SQL (crash-injection for #19) |
+| 20 | Zero unauthorized Calendar calls on lease-busy | Confirmed via mock-server call log | direct SQL + real n8n execution |
+| 21 | Idempotency lookup `401`/`403`/`429`/`500`/timeout | Every case: `lookup_failed` decision, **zero `POST` calls** | real n8n execution |
+| 22 | Malformed idempotency lookup response (`items` not an array) | `lookup_failed` decision, zero `POST` calls | real n8n execution |
+| 23 | Zero / one / multiple idempotency matches | Zero → creates; one valid → adopts with zero `POST`s; multiple → `conflict`, zero `POST`s | real n8n execution |
+| 24 | One match with a mismatched `appointmentId` | `conflict`, zero mutation, zero `POST`s | real n8n execution |
+| 25 | `update` with a missing/invalid event id | `conflict`, **zero HTTP calls of any kind** | real n8n execution |
+| 26 | `update` with a missing/invalid etag | `conflict`, zero HTTP calls | real n8n execution |
+| 27 | Invalid outbox operation (not `create`/`update`/`cancel`) | `failure`, zero HTTP calls | real n8n execution |
+| 28 | Rich provider fields (synthetic summary, description, location, attendee/organizer email, conference data, attachment) | None of those values found anywhere in Postgres afterward | real n8n execution, direct SQL inspection |
+| 29 | Oversized/malformed event fields, invalid timestamps | All flagged `malformed`, zero applied, page still completes | real n8n execution |
+| 30 | Invalid `items` shape, oversized page token, oversized sync token | Each fails closed with a controlled `calendar_error`; cursor confirmed unchanged (`sync_token`/`pending_page_token` still `NULL`) | real n8n execution, direct SQL inspection |
+| 31 | Cursor unchanged on a rejected/invalid page (against a calendar with a pre-existing, non-null cursor) | Cursor value confirmed byte-identical before and after the rejected page | real n8n execution, direct SQL inspection |
+| 32 | Calendar-error and aborted final response schemas, after lease release | Both confirmed present and correctly shaped; lease confirmed released in Postgres | real n8n execution |
+| 33 | Multi-page pull-sync, `410` recovery, two-item paired-item correctness, repeated cancellation | All re-verified against the corrected graph — see [Mutation fail-closed design](#mutation-fail-closed-design) for the repeated-cancellation result specifically | real n8n execution |
 
-All 27 direct-SQL scenarios above (tests 1–20, several covering more than one required category) passed. All real-n8n-execution scenarios listed passed after the two n8n-specific bugs found during this testing (each-item-mode return shape; `.first()` not being paired-item-aware) were fixed and re-verified.
+All 27 direct-SQL scenarios and all 26 real-n8n-execution scenarios pass (53 total; several SQL scenarios and n8n scenarios cover the same requirement from each layer, counted individually above).
 
 ## Clean re-import results
 
 - **Official CLI export/import**: exported via `n8n export:workflow`, sanitized (zero nodes carry a `credentials` key — verified programmatically), imported into a second, genuinely fresh n8n instance.
-- **Second clean PostgreSQL instance**: a fresh `initdb` cluster (different port, different database) with the schema and all ten functions installed from scratch via the exact DDL in [Schema](#schema). The multi-page pull-sync scenario and the outbox create scenario were re-run against this second database — identical results (`pages: 2, applied: 3`; `claimed: 1, applied: 1`).
-- **Execution-data persistence**: this workflow's settings disable execution persistence (`saveManualExecutions: false`, `saveDataSuccessExecution/ErrorExecution: 'none'`) — confirmed the committed file carries these settings. Functional testing above required a temporary, uncommitted copy with persistence enabled specifically to inspect results; the committed file was never altered for this.
+- **Second clean PostgreSQL instance**: a fresh `initdb` cluster (different port, different database) with the schema and all ten functions installed from scratch via the exact DDL in [Schema](#schema).
+- **Execution-data persistence**: this workflow's settings disable execution persistence (`saveManualExecutions: false`, `saveDataSuccessExecution/ErrorExecution: 'none'`) — confirmed the committed file carries these settings.
 
 ## Required nodes
 
 - **Execute Workflow Trigger** (`n8n-nodes-base.executeWorkflowTrigger`, v1.2) — entry point; single input field, `syncCalendarId`.
 - **Sticky Note** (`n8n-nodes-base.stickyNote`, v1) — in-canvas scope note; not part of execution.
-- **Code** (`n8n-nodes-base.code`, v2) — used **twenty** times: input validation, page-state initialization and accumulation, fetch/finalize classification, and eight nodes running in "Run Once for Each Item" mode for per-item outbox classification and request building (see [Feasibility investigation](#feasibility-investigation) for the two n8n-specific behaviors of that mode this design had to account for).
-- **IF** (`n8n-nodes-base.if`, v2.2) — used **nine** times, gating every mutation and every loop-continuation decision structurally: input validity, lease acquisition, HTTP success, expired-token detection, page-apply success, final-page detection, whether there's outbox work at all, create-vs-mutate routing, and idempotency-adopt-vs-create routing.
-- **Merge** (`n8n-nodes-base.merge`, v3, append mode) — used **two** times, to reconverge the create/mutate outbox branches before a shared finalize step, and to reconverge the "no outbox work" path with the finalized-work path before the final summary.
-- **Postgres** (`n8n-nodes-base.postgres`, v2.6) — used **eight** times, `Execute Query` operation, every query fully parameterized. Each call is a single, self-contained function invocation (see [Schema](#schema)) rather than an inline multi-statement query — this repository's [`whatsapp-appointment-confirmation-cancellation`](whatsapp-appointment-confirmation-cancellation.md#root-cause-correction) documents in detail why a same-snapshot, multi-CTE inline statement is not a safe substitute for this pattern under concurrency.
+- **Code** (`n8n-nodes-base.code`, v2) — used **twenty-five** times: input validation, page-state initialization and accumulation, fetch/finalize classification and response restoration, and per-item outbox classification, idempotency decision-making, and mutate-request validation (see [Feasibility investigation](#feasibility-investigation) for the two n8n-specific each-item-mode behaviors this design accounts for).
+- **IF** (`n8n-nodes-base.if`, v2.2) — used **twelve** times, gating every mutation and every loop-continuation decision structurally: input validity, lease acquisition, HTTP success + page-shape validity, expired-token detection, page-apply success, final-page detection, whether there's outbox work at all, create-vs-mutate-vs-invalid-operation routing, whether the idempotency lookup found a genuinely usable match, and whether a mutate request passes its own pre-flight validation.
+- **Merge** (`n8n-nodes-base.merge`, v3, append mode) — used **two** times, to reconverge the create/mutate/invalid-operation outbox branches before a shared finalize step, and to reconverge the "no outbox work" path with the finalized-work path before the final summary.
+- **Postgres** (`n8n-nodes-base.postgres`, v2.6) — used **eight** times, `Execute Query` operation, every query fully parameterized. Each call is a single, self-contained function invocation (see [Schema](#schema)).
 - **HTTP Request** (`n8n-nodes-base.httpRequest`, v4.2) — used **four** times (fetch events page, idempotency pre-check, create event, mutate event), each with `Never Error` + `Full Response` + `onError: continueErrorOutput`, so HTTP-status failures and transport-level failures both route to controlled classification instead of crashing the execution.
 
 All node types are part of n8n core — no community nodes required, and nothing here requires an n8n Enterprise-licensed feature.
@@ -234,8 +311,6 @@ CREATE TABLE sync_conflicts (
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
-
-The ten functions this workflow calls, in the exact form verified during testing:
 
 ```sql
 CREATE OR REPLACE FUNCTION sync_lease_acquire(p_calendar_id text, p_owner text, p_ttl_seconds integer)
@@ -328,20 +403,25 @@ CREATE OR REPLACE FUNCTION sync_outbox_finalize(p_outcome text, p_outbox_id bigi
  RETURNS TABLE(out_ok boolean, out_reason text)
  LANGUAGE plpgsql
 AS $$
+DECLARE
+  v_ok BOOLEAN;
 BEGIN
   IF p_outcome = 'success' THEN
     RETURN QUERY SELECT * FROM sync_outbox_finalize_success(
       p_outbox_id, p_calendar_id, p_owner, p_appointment_id, p_operation, p_google_event_id, p_etag, p_updated
     );
+    RETURN;
   ELSIF p_outcome = 'conflict' THEN
-    RETURN QUERY SELECT (SELECT out_ok FROM sync_outbox_finalize_conflict(
+    SELECT f.out_ok INTO v_ok FROM sync_outbox_finalize_conflict(
       p_outbox_id, p_calendar_id, p_owner, p_appointment_id, p_google_event_id, p_reason, p_details
-    )), p_reason;
+    ) f;
   ELSE
-    RETURN QUERY SELECT (SELECT out_ok FROM sync_outbox_finalize_failure(
+    SELECT f.out_ok INTO v_ok FROM sync_outbox_finalize_failure(
       p_outbox_id, p_calendar_id, p_owner, p_reason
-    )), p_reason;
+    ) f;
   END IF;
+
+  RETURN QUERY SELECT v_ok, p_reason;
 END;
 $$
 ;
@@ -391,6 +471,8 @@ CREATE OR REPLACE FUNCTION sync_outbox_finalize_success(p_outbox_id bigint, p_ca
  RETURNS TABLE(out_ok boolean, out_reason text)
  LANGUAGE plpgsql
 AS $$
+DECLARE
+  v_updated TIMESTAMPTZ;
 BEGIN
   PERFORM 1 FROM sync_calendars sc
     WHERE sc.id = p_calendar_id AND sc.lease_owner = p_owner AND sc.lease_expires_at >= now();
@@ -399,19 +481,32 @@ BEGIN
     RETURN;
   END IF;
 
+  -- Defense in depth: never let a malformed provider timestamp abort
+  -- this call. n8n already bound-validates p_updated as a short string
+  -- before calling this function, but format validity (a genuine
+  -- parseable timestamp) is verified here, exception-safe.
+  v_updated := NULL;
+  IF p_updated IS NOT NULL THEN
+    BEGIN
+      v_updated := p_updated::TIMESTAMPTZ;
+    EXCEPTION WHEN OTHERS THEN
+      v_updated := NULL;
+    END;
+  END IF;
+
   UPDATE sync_outbox o
   SET status = 'applied', google_event_id = p_google_event_id, updated_at = now()
   WHERE o.id = p_outbox_id;
 
   IF p_operation = 'cancel' THEN
     UPDATE appointment_calendar_mappings m
-    SET sync_status = 'calendar_cancelled', etag = p_etag, last_calendar_updated = p_updated::TIMESTAMPTZ,
+    SET sync_status = 'calendar_cancelled', etag = p_etag, last_calendar_updated = v_updated,
         last_seen_at = now(), updated_at = now()
     WHERE m.appointment_id = p_appointment_id AND m.calendar_id = p_calendar_id;
   ELSE
     INSERT INTO appointment_calendar_mappings
       (appointment_id, calendar_id, google_event_id, etag, mapping_version, sync_status, last_calendar_updated, last_seen_at)
-    VALUES (p_appointment_id, p_calendar_id, p_google_event_id, p_etag, 1, 'synced', p_updated::TIMESTAMPTZ, now())
+    VALUES (p_appointment_id, p_calendar_id, p_google_event_id, p_etag, 1, 'synced', v_updated, now())
     ON CONFLICT (appointment_id) DO UPDATE
     SET google_event_id = EXCLUDED.google_event_id, etag = EXCLUDED.etag,
         mapping_version = appointment_calendar_mappings.mapping_version + 1,
@@ -433,8 +528,13 @@ DECLARE
   v_event_id TEXT;
   v_status TEXT;
   v_etag TEXT;
-  v_updated TEXT;
+  v_updated_raw TEXT;
+  v_updated TIMESTAMPTZ;
   v_appt_id TEXT;
+  v_appt_id_raw TEXT;
+  v_appt_id_valid BOOLEAN;
+  v_valid BOOLEAN;
+  v_projected JSONB;
   v_existing appointment_calendar_mappings%ROWTYPE;
   v_appt_row appointments%ROWTYPE;
   v_other_mapping appointment_calendar_mappings%ROWTYPE;
@@ -453,109 +553,197 @@ BEGIN
     RETURN;
   END IF;
 
+  -- ---------------------------------------------------------------
+  -- Page-level validation: fail closed and leave the cursor exactly
+  -- where it was on anything that doesn't look like a genuine Google
+  -- Calendar events.list page. This runs BEFORE any per-item work or
+  -- any cursor-advancing write, so a malformed page can never advance
+  -- past unprocessed data.
+  -- ---------------------------------------------------------------
+  IF jsonb_typeof(p_items) IS DISTINCT FROM 'array' THEN
+    RETURN QUERY SELECT false, 'invalid_items_shape'::TEXT, 0, 0, 0, 0, 0;
+    RETURN;
+  END IF;
+
+  IF jsonb_array_length(p_items) > 2500 THEN
+    RETURN QUERY SELECT false, 'page_too_large'::TEXT, 0, 0, 0, 0, 0;
+    RETURN;
+  END IF;
+
+  IF p_next_page_token IS NOT NULL AND length(p_next_page_token) > 2048 THEN
+    RETURN QUERY SELECT false, 'invalid_page_token'::TEXT, 0, 0, 0, 0, 0;
+    RETURN;
+  END IF;
+
+  IF p_next_sync_token IS NOT NULL AND length(p_next_sync_token) > 2048 THEN
+    RETURN QUERY SELECT false, 'invalid_sync_token'::TEXT, 0, 0, 0, 0, 0;
+    RETURN;
+  END IF;
+
   FOR v_item IN SELECT jsonb_array_elements(p_items) LOOP
-    v_event_id := v_item->>'id';
-    v_status := v_item->>'status';
-    v_etag := v_item->>'etag';
-    v_updated := v_item->>'updated';
-    v_appt_id := v_item#>>'{extendedProperties,private,appointmentId}';
+    BEGIN
+      -- Every per-item code path below is inside this nested block so
+      -- that ANY unexpected error for one malformed item (a bad cast,
+      -- an unexpected type) is caught here and counted as malformed --
+      -- it can never abort the rest of the page or the cursor advance.
 
-    IF v_event_id IS NULL OR v_event_id = '' THEN
-      v_malformed := v_malformed + 1;
-      INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
-      VALUES (NULL, p_calendar_id, NULL, 'malformed_event', v_item);
-      CONTINUE;
-    END IF;
-
-    IF v_appt_id IS NULL OR v_appt_id = '' THEN
-      v_unknown := v_unknown + 1;
-      INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
-      VALUES (NULL, p_calendar_id, v_event_id, 'unknown_event', v_item);
-      CONTINUE;
-    END IF;
-
-    SELECT * INTO v_existing FROM appointment_calendar_mappings m
-      WHERE m.calendar_id = p_calendar_id AND m.google_event_id = v_event_id;
-
-    IF NOT FOUND THEN
-      -- No local mapping row for this (calendar_id, google_event_id) pair
-      -- yet. Only ever adopt it if the marker's appointmentId resolves to
-      -- a REAL, known Postgres appointment -- Postgres decides identity,
-      -- never the incoming Calendar payload alone -- and that appointment
-      -- doesn't already have a mapping elsewhere (which would make this a
-      -- duplicate-claim conflict, not a fresh discovery).
-      SELECT * INTO v_appt_row FROM appointments a WHERE a.appointment_id = v_appt_id;
-      IF NOT FOUND THEN
-        v_unknown := v_unknown + 1;
+      IF jsonb_typeof(v_item) IS DISTINCT FROM 'object' THEN
+        v_malformed := v_malformed + 1;
         INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
-        VALUES (v_appt_id, p_calendar_id, v_event_id, 'unknown_appointment_reference', v_item);
+        VALUES (NULL, p_calendar_id, NULL, 'malformed_event', jsonb_build_object('reason', 'not_an_object'));
         CONTINUE;
       END IF;
 
-      SELECT * INTO v_other_mapping FROM appointment_calendar_mappings m2 WHERE m2.appointment_id = v_appt_id;
-      IF FOUND THEN
+      v_event_id := v_item->>'id';
+      v_status := v_item->>'status';
+      v_etag := v_item->>'etag';
+      v_updated_raw := v_item->>'updated';
+      v_appt_id_raw := v_item#>>'{extendedProperties,private,appointmentId}';
+
+      -- Bounded, allowlist validation of every provider-controlled
+      -- field before it is cast, stored, or used to build a URL.
+      v_valid := v_event_id IS NOT NULL
+        AND length(v_event_id) BETWEEN 1 AND 1024
+        AND v_event_id ~ '^[A-Za-z0-9_-]+$'
+        AND v_status IN ('confirmed', 'cancelled', 'tentative')
+        AND (v_etag IS NULL OR length(v_etag) <= 512)
+        AND v_updated_raw IS NOT NULL
+        AND length(v_updated_raw) <= 64;
+
+      v_updated := NULL;
+      IF v_valid THEN
+        BEGIN
+          v_updated := v_updated_raw::TIMESTAMPTZ;
+        EXCEPTION WHEN OTHERS THEN
+          v_valid := false;
+        END;
+      END IF;
+
+      IF NOT v_valid THEN
+        v_malformed := v_malformed + 1;
+        INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
+        VALUES (
+          NULL, p_calendar_id,
+          CASE WHEN v_event_id IS NOT NULL AND length(v_event_id) <= 1024 THEN left(v_event_id, 1024) ELSE NULL END,
+          'malformed_event', jsonb_build_object('reason', 'invalid_or_unbounded_field')
+        );
+        CONTINUE;
+      END IF;
+
+      v_appt_id_valid := v_appt_id_raw IS NOT NULL
+        AND length(v_appt_id_raw) BETWEEN 1 AND 128
+        AND v_appt_id_raw ~ '^[A-Za-z0-9_-]+$';
+      v_appt_id := CASE WHEN v_appt_id_valid THEN v_appt_id_raw ELSE NULL END;
+
+      -- Sanitized, bounded projection -- the ONLY shape ever persisted
+      -- for this event. Never the raw provider object: no summary,
+      -- description, location, attendees, organizer, conferenceData,
+      -- or attachments are ever read from v_item again below.
+      v_projected := jsonb_build_object(
+        'event_id', left(v_event_id, 1024),
+        'status', v_status,
+        'etag', CASE WHEN v_etag IS NOT NULL THEN left(v_etag, 512) ELSE NULL END,
+        'updated', v_updated,
+        'appointment_id_marker', v_appt_id
+      );
+
+      IF v_appt_id_raw IS NOT NULL AND NOT v_appt_id_valid THEN
+        -- A marker is present but fails the bounded allowlist --
+        -- corrupt/untrustworthy data, never used for matching.
+        v_malformed := v_malformed + 1;
+        INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
+        VALUES (NULL, p_calendar_id, left(v_event_id, 1024), 'malformed_event', v_projected);
+        CONTINUE;
+      END IF;
+
+      IF v_appt_id IS NULL THEN
+        v_unknown := v_unknown + 1;
+        INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
+        VALUES (NULL, p_calendar_id, left(v_event_id, 1024), 'unknown_event', v_projected);
+        CONTINUE;
+      END IF;
+
+      SELECT * INTO v_existing FROM appointment_calendar_mappings m
+        WHERE m.calendar_id = p_calendar_id AND m.google_event_id = v_event_id;
+
+      IF NOT FOUND THEN
+        SELECT * INTO v_appt_row FROM appointments a WHERE a.appointment_id = v_appt_id;
+        IF NOT FOUND THEN
+          v_unknown := v_unknown + 1;
+          INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
+          VALUES (v_appt_id, p_calendar_id, left(v_event_id, 1024), 'unknown_appointment_reference', v_projected);
+          CONTINUE;
+        END IF;
+
+        SELECT * INTO v_other_mapping FROM appointment_calendar_mappings m2 WHERE m2.appointment_id = v_appt_id;
+        IF FOUND THEN
+          v_conflict := v_conflict + 1;
+          INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
+          VALUES (v_appt_id, p_calendar_id, left(v_event_id, 1024), 'duplicate_mapping_candidate', v_projected);
+          CONTINUE;
+        END IF;
+
+        IF v_status = 'cancelled' THEN
+          v_tombstoned := v_tombstoned + 1;
+          INSERT INTO appointment_calendar_mappings
+            (appointment_id, calendar_id, google_event_id, etag, mapping_version, sync_status, last_calendar_updated, last_seen_at)
+          VALUES (v_appt_id, p_calendar_id, v_event_id, v_etag, 1, 'calendar_cancelled', v_updated, now());
+          CONTINUE;
+        END IF;
+
+        v_applied := v_applied + 1;
+        INSERT INTO appointment_calendar_mappings
+          (appointment_id, calendar_id, google_event_id, etag, mapping_version, sync_status, last_calendar_updated, last_seen_at)
+        VALUES (v_appt_id, p_calendar_id, v_event_id, v_etag, 1, 'synced', v_updated, now());
+        CONTINUE;
+      END IF;
+
+      IF v_existing.appointment_id <> v_appt_id THEN
         v_conflict := v_conflict + 1;
         INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
-        VALUES (v_appt_id, p_calendar_id, v_event_id, 'duplicate_mapping_candidate', v_item);
+        VALUES (v_existing.appointment_id, p_calendar_id, left(v_event_id, 1024), 'appointment_id_mismatch', v_projected);
+        UPDATE appointment_calendar_mappings m2 SET last_seen_at = now()
+          WHERE m2.appointment_id = v_existing.appointment_id AND m2.calendar_id = p_calendar_id;
         CONTINUE;
       END IF;
 
       IF v_status = 'cancelled' THEN
-        -- A pre-existing, already-cancelled event for a known appointment
-        -- with no mapping yet: record the tombstoned mapping directly,
-        -- no need to round-trip through "synced" first.
         v_tombstoned := v_tombstoned + 1;
-        INSERT INTO appointment_calendar_mappings
-          (appointment_id, calendar_id, google_event_id, etag, mapping_version, sync_status, last_calendar_updated, last_seen_at)
-        VALUES (v_appt_id, p_calendar_id, v_event_id, v_etag, 1, 'calendar_cancelled', v_updated::TIMESTAMPTZ, now());
+        IF v_existing.sync_status <> 'calendar_cancelled' THEN
+          INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
+          VALUES (v_appt_id, p_calendar_id, left(v_event_id, 1024), 'calendar_side_cancellation', v_projected);
+        END IF;
+        UPDATE appointment_calendar_mappings m3
+        SET sync_status = 'calendar_cancelled', etag = v_etag, last_calendar_updated = v_updated,
+            last_seen_at = now(), updated_at = now()
+        WHERE m3.appointment_id = v_appt_id AND m3.calendar_id = p_calendar_id;
+        CONTINUE;
+      END IF;
+
+      IF v_existing.etag IS NOT NULL AND v_existing.etag <> v_etag AND v_existing.sync_status = 'synced' THEN
+        v_conflict := v_conflict + 1;
+        INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
+        VALUES (v_appt_id, p_calendar_id, left(v_event_id, 1024), 'concurrent_edit', v_projected);
+        UPDATE appointment_calendar_mappings m4
+        SET sync_status = 'conflict', etag = v_etag, last_calendar_updated = v_updated,
+            last_seen_at = now(), updated_at = now()
+        WHERE m4.appointment_id = v_appt_id AND m4.calendar_id = p_calendar_id;
         CONTINUE;
       END IF;
 
       v_applied := v_applied + 1;
-      INSERT INTO appointment_calendar_mappings
-        (appointment_id, calendar_id, google_event_id, etag, mapping_version, sync_status, last_calendar_updated, last_seen_at)
-      VALUES (v_appt_id, p_calendar_id, v_event_id, v_etag, 1, 'synced', v_updated::TIMESTAMPTZ, now());
-      CONTINUE;
-    END IF;
-
-    IF v_existing.appointment_id <> v_appt_id THEN
-      v_conflict := v_conflict + 1;
-      INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
-      VALUES (v_existing.appointment_id, p_calendar_id, v_event_id, 'appointment_id_mismatch', v_item);
-      UPDATE appointment_calendar_mappings m2 SET last_seen_at = now()
-        WHERE m2.appointment_id = v_existing.appointment_id AND m2.calendar_id = p_calendar_id;
-      CONTINUE;
-    END IF;
-
-    IF v_status = 'cancelled' THEN
-      v_tombstoned := v_tombstoned + 1;
-      IF v_existing.sync_status <> 'calendar_cancelled' THEN
-        INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
-        VALUES (v_appt_id, p_calendar_id, v_event_id, 'calendar_side_cancellation', v_item);
-      END IF;
-      UPDATE appointment_calendar_mappings m3
-      SET sync_status = 'calendar_cancelled', etag = v_etag, last_calendar_updated = v_updated::TIMESTAMPTZ,
+      UPDATE appointment_calendar_mappings m5
+      SET etag = v_etag, last_calendar_updated = v_updated,
           last_seen_at = now(), updated_at = now()
-      WHERE m3.appointment_id = v_appt_id AND m3.calendar_id = p_calendar_id;
-      CONTINUE;
-    END IF;
+      WHERE m5.appointment_id = v_appt_id AND m5.calendar_id = p_calendar_id;
 
-    IF v_existing.etag IS NOT NULL AND v_existing.etag <> v_etag AND v_existing.sync_status = 'synced' THEN
-      v_conflict := v_conflict + 1;
-      INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
-      VALUES (v_appt_id, p_calendar_id, v_event_id, 'concurrent_edit', v_item);
-      UPDATE appointment_calendar_mappings m4
-      SET sync_status = 'conflict', etag = v_etag, last_calendar_updated = v_updated::TIMESTAMPTZ,
-          last_seen_at = now(), updated_at = now()
-      WHERE m4.appointment_id = v_appt_id AND m4.calendar_id = p_calendar_id;
-      CONTINUE;
-    END IF;
-
-    v_applied := v_applied + 1;
-    UPDATE appointment_calendar_mappings m5
-    SET etag = v_etag, last_calendar_updated = v_updated::TIMESTAMPTZ,
-        last_seen_at = now(), updated_at = now()
-    WHERE m5.appointment_id = v_appt_id AND m5.calendar_id = p_calendar_id;
+    EXCEPTION WHEN OTHERS THEN
+      -- Defense in depth: any error this far down for one item (a
+      -- constraint violation, an unexpected type coercion failure)
+      -- must not abort the page. Counted as malformed; nothing about
+      -- this specific item is persisted.
+      v_malformed := v_malformed + 1;
+    END;
   END LOOP;
 
   SELECT sc2.full_sync_started_at INTO v_full_sync_started_at FROM sync_calendars sc2 WHERE sc2.id = p_calendar_id;
@@ -602,7 +790,15 @@ $$
 ;
 ```
 
-Every function follows the same pattern established by this repository's other Postgres-backed workflows: `RETURNS TABLE` columns are prefixed (`out_...`) to avoid ambiguity with real table column names inside the function body (a bug class documented and fixed in [`whatsapp-appointment-confirmation-cancellation`](whatsapp-appointment-confirmation-cancellation.md)), and every function always returns exactly one row (or, for the batch-claim function, zero-to-N rows by design, handled on the n8n side via `alwaysOutputData` — see [Feasibility investigation](#feasibility-investigation)).
+The ten functions were rewritten in this round to fix the two bugs described in [Feasibility investigation](#feasibility-investigation) (`sync_outbox_finalize`'s ambiguous `out_ok` reference) and to add the bounded, allowlist projection and per-item exception safety described in [Data-minimization design](#data-minimization-design) (`sync_process_page`). Every function follows the pattern established by this repository's other Postgres-backed workflows: `RETURNS TABLE` columns are prefixed (`out_...`) to avoid ambiguity with real table column names inside the function body, and every function always returns exactly one row (or, for the batch-claim function, zero-to-N rows by design, handled on the n8n side via `alwaysOutputData` — see [Feasibility investigation](#feasibility-investigation)).
+
+## Migration notes for an existing installation
+
+If you already installed the schema and functions from an earlier round of this workflow, re-run the full function block above (`CREATE OR REPLACE FUNCTION` is safe to re-apply) — no table structure changed, only function bodies. Specifically:
+
+- `sync_process_page` gained page-level and per-item validation, bounded projection, and exception-safe per-item handling. Any `sync_conflicts` rows written by the *old* version of this function may contain full raw event payloads rather than the new five-field allowlist — if this matters for your compliance posture, purge or redact pre-existing `sync_conflicts.details` values written before this update.
+- `sync_outbox_finalize` had an ambiguous `out_ok` column reference that made every `conflict`/`failure` outbox finalize call throw a hard Postgres error, aborting the execution rather than resolving the outbox row. If you deployed the earlier version, any execution that ever hit an outbox conflict or failure would have failed the *entire* workflow run rather than continuing — check for unexpectedly-`in_flight` outbox rows and re-run this workflow after upgrading the function.
+- `sync_outbox_finalize_success` now validates the `updated` timestamp in an exception-safe block before casting, instead of letting a malformed value abort the call.
 
 ## Setup steps
 
@@ -623,12 +819,13 @@ Every function follows the same pattern established by this repository's other P
 - **No automatic retry of a `conflict` or `failed` outbox row beyond what staleness-based reclaim already provides** — a `failed` row is reclaimed by the *next* drain run, not retried in-line.
 - **The real Google Calendar API was never contacted during testing** — verified only through a temporary, uncommitted mock-bound copy, disclosed precisely in [Test procedure](#test-procedure). Verify against your own real, non-production calendar before relying on this.
 - **Recurring events**: `singleEvents=true` is used consistently for both full and incremental sync, so recurring events are synced as individual instances, not as a master event with expansion logic — this keeps matching behavior identical between full and incremental sync, but means a recurrence *pattern* change on Calendar's side surfaces as many individual instance conflicts, not one.
+- **A pull-sync that runs immediately after an outbox-created event, within the same or a very soon following execution, will legitimately re-see that event** (its sync token was issued before the creation) and re-apply its own already-correct etag — this is honest, correct incremental-sync behavior, not a bug, and was specifically what surfaced the mock server's own incremental-sync fidelity gap during this round's testing (see [Feasibility investigation](#feasibility-investigation)).
 - This workflow has been verified as a template against the specific n8n, Node.js, and PostgreSQL versions documented here. It is **not** described as production-ready or production-tested.
 - Only n8n core nodes are used; this has not been tested against any n8n Enterprise-only feature, and none are required.
 
 ## Data handled
 
-Reads `syncCalendarId` from its caller — never a Calendar id or event id, both of which are read exclusively from Postgres. Reads and writes `appointment_calendar_mappings`, `sync_calendars` (cursor/lease state), `sync_outbox` (drains, never enqueues), and `sync_conflicts`. Makes outbound HTTP calls only to the fixed Google Calendar API host, only for calendars and events already validated against Postgres state. Its final summary output contains only aggregate counts (`pull.pages/applied/tombstoned/unknown/malformed/conflict`, `outbox.claimed/applied/conflicted/failed`) and status — never customer message text, calendar event bodies, credentials, or raw Postgres rows.
+Reads `syncCalendarId` from its caller — never a Calendar id or event id, both of which are read exclusively from Postgres. Reads and writes `appointment_calendar_mappings`, `sync_calendars` (cursor/lease state), `sync_outbox` (drains, never enqueues), and `sync_conflicts`. Every value ever persisted from a Calendar-provided event is limited to a bounded five-field allowlist (event id, status, etag, updated timestamp, appointment id marker) — see [Data-minimization design](#data-minimization-design); no summary, description, location, attendee data, organizer data, conference links, or attachments are ever read past the point where they're projected out. Makes outbound HTTP calls only to the fixed Google Calendar API host, only for calendars and events already validated against Postgres state. Its final summary output contains only aggregate counts (`pull.pages/applied/tombstoned/unknown/malformed/conflict`, `outbox.claimed/applied/conflicted/failed`) and status — never customer message text, calendar event bodies, credentials, or raw Postgres rows.
 
 ## License and source
 
