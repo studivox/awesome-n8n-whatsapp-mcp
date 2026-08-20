@@ -1,0 +1,1420 @@
+{
+  "name": "google-calendar-postgres-sync",
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "syncCalendarId",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "trigger",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "content": "## Google Calendar <-> Postgres Synchronization\n\nReusable sub-workflow. Input: syncCalendarId -- an internal id\nreferencing a row in sync_calendars. The real Google Calendar id\nand API host are never caller-supplied; both come from that row\nand a fixed host.\n\nPhase 1 (loop): pull-sync via events.list, paginated, cursor-\nadvanced atomically per page inside process_page. A 410 Gone\nresets to a full resync and restarts the loop.\n\nPhase 2: drains sync_outbox (Postgres -> Calendar creates/\nupdates/cancels), idempotency-checked via a stable client-\ngenerated key before any create, conditional (If-Match) before\nany update.\n\nA row-based lease (not pg_advisory_lock -- see docs) ensures\nonly one runner touches a given calendar at a time, and self-\nheals on TTL if a runner crashes without releasing.",
+        "height": 420,
+        "width": 420
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -480
+      ],
+      "id": "scope-note",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst raw = $input.first().json.syncCalendarId;\nconst isValid = typeof raw === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(raw);\nreturn [{ json: {\n  valid: isValid,\n  syncCalendarId: isValid ? raw : null,\n  ownerId: `sync-${$execution.id}-${Math.random().toString(36).slice(2, 10)}`,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ],
+      "id": "validate-input",
+      "name": "Validate Input"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        400,
+        0
+      ],
+      "id": "input-valid",
+      "name": "Input Valid?"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nreturn [{ json: { status: 'rejected', reason: 'invalid_sync_calendar_id' } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        -150
+      ],
+      "id": "build-rejected-response",
+      "name": "Build Rejected Response"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_lease_acquire($1, $2, $3);",
+        "options": {
+          "queryReplacement": "={{ [$json.syncCalendarId, $json.ownerId, 600] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        600,
+        0
+      ],
+      "id": "acquire-lease",
+      "name": "Acquire Lease"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.out_acquired }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        0
+      ],
+      "id": "lease-acquired",
+      "name": "Lease Acquired?"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nreturn [{ json: { status: 'lease_busy' } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        -150
+      ],
+      "id": "build-lease-busy-response",
+      "name": "Build Lease Busy Response"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst lease = $input.first().json;\nconst validated = $('Validate Input').first().json;\nreturn [{ json: {\n  syncCalendarId: validated.syncCalendarId,\n  ownerId: validated.ownerId,\n  googleCalendarId: lease.out_google_calendar_id,\n  syncToken: lease.out_sync_token,\n  pageToken: lease.out_pending_page_token,\n  isFullSync: lease.out_needs_full_resync,\n  pages: 0, applied: 0, tombstoned: 0, unknown: 0, malformed: 0, conflict: 0,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        100
+      ],
+      "id": "init-page-state",
+      "name": "Init Page State"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst s = $input.first().json;\nconst qs = { singleEvents: 'true' };\nif (s.isFullSync) {\n  qs.showDeleted = 'false';\n  if (s.pageToken) qs.pageToken = s.pageToken;\n} else {\n  qs.syncToken = s.syncToken;\n  if (s.pageToken) qs.pageToken = s.pageToken;\n}\nreturn [{ json: { ...s, qs } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        100
+      ],
+      "id": "build-fetch-params",
+      "name": "Build Fetch Params"
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.googleCalendarId) + '/events' }}",
+        "method": "GET",
+        "sendQuery": true,
+        "specifyQuery": "json",
+        "jsonQuery": "={{ JSON.stringify($json.qs || {}) }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.headers || {}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 8000
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1400,
+        100
+      ],
+      "id": "fetch-events-page",
+      "name": "Fetch Events Page",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst resp = $input.first().json;\nconst s = $('Build Fetch Params').first().json;\nconst httpStatus = (resp.statusCode !== undefined) ? resp.statusCode : 'connection_error';\nconst body = resp.body || {};\nconst httpOk = httpStatus === 200;\nconst items = httpOk ? (body.items || []) : [];\nconst nextPageToken = httpOk ? (body.nextPageToken || null) : null;\nconst nextSyncToken = httpOk ? (body.nextSyncToken || null) : null;\nreturn [{ json: {\n  ...s, httpStatus, httpOk, isGone: httpStatus === 410,\n  items, nextPageToken, nextSyncToken, isFinalPage: !nextPageToken,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        100
+      ],
+      "id": "classify-fetch-result",
+      "name": "Classify Fetch Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.httpOk }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1800,
+        100
+      ],
+      "id": "fetch-ok",
+      "name": "Fetch Ok?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.isGone && !$json.isFullSync }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2000,
+        250
+      ],
+      "id": "gone-and-not-full-sync",
+      "name": "Gone And Not Full Sync?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_reset_for_full_resync($1, $2);",
+        "options": {
+          "queryReplacement": "={{ [$json.syncCalendarId, $json.ownerId] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2200,
+        350
+      ],
+      "id": "reset-for-full-resync",
+      "name": "Reset For Full Resync"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst s = $('Classify Fetch Result').first().json;\nreturn [{ json: { ...s, isFullSync: true, pageToken: null, syncToken: null } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        350
+      ],
+      "id": "prepare-full-resync-state",
+      "name": "Prepare Full Resync State"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst s = $input.first().json;\nreturn [{ json: {\n  status: 'calendar_error', httpStatus: s.httpStatus,\n  syncCalendarId: s.syncCalendarId, ownerId: s.ownerId,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        550
+      ],
+      "id": "build-calendar-error-response",
+      "name": "Build Calendar Error Response"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_lease_release($1, $2);",
+        "options": {
+          "queryReplacement": "={{ [$json.syncCalendarId, $json.ownerId] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2400,
+        550
+      ],
+      "id": "release-lease-(error)",
+      "name": "Release Lease (Error)"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_process_page($1, $2, $3::jsonb, $4, $5, $6, $7);",
+        "options": {
+          "queryReplacement": "={{ [$json.syncCalendarId, $json.ownerId, JSON.stringify($json.items), $json.nextPageToken, $json.nextSyncToken, $json.isFinalPage, $json.isFullSync] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1800,
+        250
+      ],
+      "id": "process-page",
+      "name": "Process Page"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.out_ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2000,
+        50
+      ],
+      "id": "page-applied-ok",
+      "name": "Page Applied Ok?"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst r = $input.first().json;\nconst s = $('Classify Fetch Result').first().json;\nreturn [{ json: { status: 'aborted', reason: r.out_reason, syncCalendarId: s.syncCalendarId, ownerId: s.ownerId } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        -100
+      ],
+      "id": "build-aborted-response",
+      "name": "Build Aborted Response"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_lease_release($1, $2);",
+        "options": {
+          "queryReplacement": "={{ [$json.syncCalendarId, $json.ownerId] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2400,
+        -100
+      ],
+      "id": "release-lease-(aborted)",
+      "name": "Release Lease (Aborted)"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst r = $input.first().json;\nconst s = $('Classify Fetch Result').first().json;\nreturn [{ json: {\n  ...s,\n  pages: s.pages + 1,\n  applied: s.applied + r.out_applied_count,\n  tombstoned: s.tombstoned + r.out_tombstoned_count,\n  unknown: s.unknown + r.out_unknown_count,\n  malformed: s.malformed + r.out_malformed_count,\n  conflict: s.conflict + r.out_conflict_count,\n  pageToken: s.nextPageToken,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        200
+      ],
+      "id": "accumulate-counts",
+      "name": "Accumulate Counts"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.isFinalPage }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2200,
+        200
+      ],
+      "id": "is-final-page",
+      "name": "Is Final Page?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_outbox_claim_batch($1, $2, $3, $4);",
+        "options": {
+          "queryReplacement": "={{ [ $('Init Page State').first().json.syncCalendarId, $('Init Page State').first().json.ownerId, 10, 600 ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2200,
+        800
+      ],
+      "id": "claim-outbox-batch",
+      "name": "Claim Outbox Batch",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst s = $('Init Page State').item.json;\nconst j = $json;\nif (j.out_id === undefined) {\n  return { json: { route: 'none', syncCalendarId: s.syncCalendarId, ownerId: s.ownerId, googleCalendarId: s.googleCalendarId } };\n}\nreturn { json: {\n  route: j.out_operation === 'create' ? 'create' : 'mutate',\n  syncCalendarId: s.syncCalendarId, ownerId: s.ownerId, googleCalendarId: s.googleCalendarId,\n  outboxId: j.out_id, appointmentId: j.out_appointment_id, operation: j.out_operation,\n  idempotencyKey: j.out_idempotency_key, payload: j.out_payload,\n  googleEventId: j.out_google_event_id, currentEtag: j.out_current_etag,\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        800
+      ],
+      "id": "classify-outbox-item",
+      "name": "Classify Outbox Item"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.route !== 'none' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2600,
+        800
+      ],
+      "id": "has-outbox-work",
+      "name": "Has Outbox Work?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.route === 'create' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2800,
+        700
+      ],
+      "id": "is-create",
+      "name": "Is Create?"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst j = $json;\nreturn { json: { ...j, qs: { privateExtendedProperty: `idempotencyKey=${j.idempotencyKey}` } } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        550
+      ],
+      "id": "build-idempotency-check-request",
+      "name": "Build Idempotency Check Request"
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.googleCalendarId) + '/events' }}",
+        "method": "GET",
+        "sendQuery": true,
+        "specifyQuery": "json",
+        "jsonQuery": "={{ JSON.stringify($json.qs || {}) }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.headers || {}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 8000
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3200,
+        550
+      ],
+      "id": "check-existing-event",
+      "name": "Check Existing Event",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst resp = $json;\nconst j = $('Build Idempotency Check Request').item.json;\nconst ok = resp.statusCode === 200;\nconst items = ok ? ((resp.body && resp.body.items) || []) : [];\nreturn { json: { ...j, existingEvent: items[0] || null, checkFailed: !ok } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3400,
+        550
+      ],
+      "id": "classify-idempotency-check",
+      "name": "Classify Idempotency Check"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.existingEvent !== null }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3600,
+        550
+      ],
+      "id": "event-already-exists",
+      "name": "Event Already Exists?"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst j = $json;\nconst e = j.existingEvent;\nreturn { json: {\n  outcome: 'success', outboxId: j.outboxId, syncCalendarId: j.syncCalendarId, ownerId: j.ownerId,\n  appointmentId: j.appointmentId, operation: j.operation,\n  googleEventId: e.id, etag: e.etag || null, updated: e.updated || null, reason: null, details: null,\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3800,
+        450
+      ],
+      "id": "prepare-adopt-existing",
+      "name": "Prepare Adopt Existing"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst j = $json;\nconst body = { ...(j.payload || {}) };\nbody.extendedProperties = { private: { appointmentId: j.appointmentId, idempotencyKey: j.idempotencyKey } };\nreturn { json: { ...j, body } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3800,
+        650
+      ],
+      "id": "build-create-request",
+      "name": "Build Create Request"
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.googleCalendarId) + '/events' }}",
+        "method": "POST",
+        "sendQuery": true,
+        "specifyQuery": "json",
+        "jsonQuery": "={{ JSON.stringify($json.qs || {}) }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.headers || {}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 8000
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4000,
+        650
+      ],
+      "id": "create-event",
+      "name": "Create Event",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst resp = $json;\nconst j = $('Build Create Request').item.json;\nconst httpStatus = (resp.statusCode !== undefined) ? resp.statusCode : 0;\nif (httpStatus >= 200 && httpStatus < 300) {\n  const e = resp.body;\n  return { json: {\n    outcome: 'success', outboxId: j.outboxId, syncCalendarId: j.syncCalendarId, ownerId: j.ownerId,\n    appointmentId: j.appointmentId, operation: j.operation,\n    googleEventId: e.id, etag: e.etag || null, updated: e.updated || null, reason: null, details: null,\n  } };\n}\nreturn { json: {\n  outcome: 'failure', outboxId: j.outboxId, syncCalendarId: j.syncCalendarId, ownerId: j.ownerId,\n  appointmentId: j.appointmentId, operation: j.operation,\n  googleEventId: null, etag: null, updated: null, reason: `http_${httpStatus}`, details: null,\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4200,
+        650
+      ],
+      "id": "classify-create-result",
+      "name": "Classify Create Result"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst j = $json;\nconst isCancel = j.operation === 'cancel';\nreturn { json: {\n  ...j,\n  method: isCancel ? 'DELETE' : 'PATCH',\n  body: isCancel ? {} : (j.payload || {}),\n  headers: j.currentEtag ? { 'If-Match': j.currentEtag } : {},\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        900
+      ],
+      "id": "build-mutate-request",
+      "name": "Build Mutate Request"
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.googleCalendarId) + '/events/' + encodeURIComponent($json.googleEventId) }}",
+        "method": "={{ $json.method }}",
+        "sendQuery": true,
+        "specifyQuery": "json",
+        "jsonQuery": "={{ JSON.stringify($json.qs || {}) }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.headers || {}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 8000
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3200,
+        900
+      ],
+      "id": "mutate-event",
+      "name": "Mutate Event",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst resp = $json;\nconst j = $('Build Mutate Request').item.json;\nconst httpStatus = (resp.statusCode !== undefined) ? resp.statusCode : 0;\nif (httpStatus === 412) {\n  return { json: {\n    outcome: 'conflict', outboxId: j.outboxId, syncCalendarId: j.syncCalendarId, ownerId: j.ownerId,\n    appointmentId: j.appointmentId, operation: j.operation,\n    googleEventId: j.googleEventId, etag: null, updated: null,\n    reason: 'etag_mismatch', details: { expected: j.currentEtag },\n  } };\n}\nif ((httpStatus >= 200 && httpStatus < 300) || httpStatus === 204) {\n  const e = resp.body || {};\n  return { json: {\n    outcome: 'success', outboxId: j.outboxId, syncCalendarId: j.syncCalendarId, ownerId: j.ownerId,\n    appointmentId: j.appointmentId, operation: j.operation,\n    googleEventId: j.googleEventId, etag: e.etag || null, updated: e.updated || null, reason: null, details: null,\n  } };\n}\nreturn { json: {\n  outcome: 'failure', outboxId: j.outboxId, syncCalendarId: j.syncCalendarId, ownerId: j.ownerId,\n  appointmentId: j.appointmentId, operation: j.operation,\n  googleEventId: null, etag: null, updated: null, reason: `http_${resp.statusCode}`, details: null,\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3400,
+        900
+      ],
+      "id": "classify-mutate-result",
+      "name": "Classify Mutate Result"
+    },
+    {
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        3800,
+        800
+      ],
+      "id": "merge-finalize-inputs",
+      "name": "Merge Finalize Inputs"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_outbox_finalize($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [$json.outcome, $json.outboxId, $json.syncCalendarId, $json.ownerId, $json.appointmentId, $json.operation, $json.googleEventId, $json.etag, $json.updated, $json.reason, JSON.stringify($json.details)] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4000,
+        800
+      ],
+      "id": "finalize-outbox-item",
+      "name": "Finalize Outbox Item"
+    },
+    {
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 2
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        4200,
+        800
+      ],
+      "id": "merge-with-none-route",
+      "name": "Merge With No-Work Path"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst s = $('Accumulate Counts').last() ? $('Accumulate Counts').last().json : $('Init Page State').first().json;\n// The Postgres finalize node's own output replaces each item's json\n// entirely (query columns only) -- the pre-finalize \"outcome\" this\n// code needs was computed upstream by Classify Create/Mutate/Idempotency\n// Result. Zip that list back up with the finalize node's out_ok by\n// position: the Postgres node processes items 1:1, preserving order\n// and count, so index-alignment is safe here.\nlet pre = [];\nlet post = [];\ntry { pre = $('Merge Finalize Inputs').all().map(i => i.json); } catch (e) { pre = []; }\ntry { post = $('Finalize Outbox Item').all().map(i => i.json); } catch (e) { post = []; }\nconst claimed = pre.length;\nlet applied = 0, conflicted = 0, failed = 0;\nfor (let idx = 0; idx < pre.length; idx++) {\n  const outcome = pre[idx].outcome;\n  const ok = post[idx] ? post[idx].out_ok : false;\n  if (outcome === 'success' && ok) applied++;\n  else if (outcome === 'conflict') conflicted++;\n  else failed++;\n}\nreturn [{ json: {\n  syncCalendarId: s.syncCalendarId, ownerId: s.ownerId,\n  pull: { pages: s.pages, applied: s.applied, tombstoned: s.tombstoned, unknown: s.unknown, malformed: s.malformed, conflict: s.conflict },\n  outbox: { claimed, applied, conflicted, failed },\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4400,
+        800
+      ],
+      "id": "accumulate-outbox-results",
+      "name": "Accumulate Outbox Results"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sync_lease_release($1, $2);",
+        "options": {
+          "queryReplacement": "={{ [$json.syncCalendarId, $json.ownerId] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4600,
+        800
+      ],
+      "id": "release-lease-(success)",
+      "name": "Release Lease (Success)"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst r = $('Accumulate Outbox Results').first().json;\nreturn [{ json: { status: 'ok', pull: r.pull, outbox: r.outbox } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4800,
+        800
+      ],
+      "id": "build-success-response",
+      "name": "Build Success Response"
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Acquire Lease",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Rejected Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acquire Lease": {
+      "main": [
+        [
+          {
+            "node": "Lease Acquired?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lease Acquired?": {
+      "main": [
+        [
+          {
+            "node": "Init Page State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Lease Busy Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Page State": {
+      "main": [
+        [
+          {
+            "node": "Build Fetch Params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Fetch Params": {
+      "main": [
+        [
+          {
+            "node": "Fetch Events Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Events Page": {
+      "main": [
+        [
+          {
+            "node": "Classify Fetch Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify Fetch Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Fetch Result": {
+      "main": [
+        [
+          {
+            "node": "Fetch Ok?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Ok?": {
+      "main": [
+        [
+          {
+            "node": "Process Page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gone And Not Full Sync?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gone And Not Full Sync?": {
+      "main": [
+        [
+          {
+            "node": "Reset For Full Resync",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Calendar Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reset For Full Resync": {
+      "main": [
+        [
+          {
+            "node": "Prepare Full Resync State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Full Resync State": {
+      "main": [
+        [
+          {
+            "node": "Build Fetch Params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Calendar Error Response": {
+      "main": [
+        [
+          {
+            "node": "Release Lease (Error)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Page": {
+      "main": [
+        [
+          {
+            "node": "Page Applied Ok?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Page Applied Ok?": {
+      "main": [
+        [
+          {
+            "node": "Accumulate Counts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Aborted Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Aborted Response": {
+      "main": [
+        [
+          {
+            "node": "Release Lease (Aborted)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Accumulate Counts": {
+      "main": [
+        [
+          {
+            "node": "Is Final Page?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Final Page?": {
+      "main": [
+        [
+          {
+            "node": "Claim Outbox Batch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Fetch Params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Outbox Batch": {
+      "main": [
+        [
+          {
+            "node": "Classify Outbox Item",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Outbox Item": {
+      "main": [
+        [
+          {
+            "node": "Has Outbox Work?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Outbox Work?": {
+      "main": [
+        [
+          {
+            "node": "Is Create?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge With No-Work Path",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Is Create?": {
+      "main": [
+        [
+          {
+            "node": "Build Idempotency Check Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Mutate Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Idempotency Check Request": {
+      "main": [
+        [
+          {
+            "node": "Check Existing Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Existing Event": {
+      "main": [
+        [
+          {
+            "node": "Classify Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "Event Already Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event Already Exists?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Adopt Existing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Create Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Adopt Existing": {
+      "main": [
+        [
+          {
+            "node": "Merge Finalize Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Create Request": {
+      "main": [
+        [
+          {
+            "node": "Create Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Event": {
+      "main": [
+        [
+          {
+            "node": "Classify Create Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify Create Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Create Result": {
+      "main": [
+        [
+          {
+            "node": "Merge Finalize Inputs",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Build Mutate Request": {
+      "main": [
+        [
+          {
+            "node": "Mutate Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mutate Event": {
+      "main": [
+        [
+          {
+            "node": "Classify Mutate Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify Mutate Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Mutate Result": {
+      "main": [
+        [
+          {
+            "node": "Merge Finalize Inputs",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge Finalize Inputs": {
+      "main": [
+        [
+          {
+            "node": "Finalize Outbox Item",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Outbox Item": {
+      "main": [
+        [
+          {
+            "node": "Merge With No-Work Path",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge With No-Work Path": {
+      "main": [
+        [
+          {
+            "node": "Accumulate Outbox Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Accumulate Outbox Results": {
+      "main": [
+        [
+          {
+            "node": "Release Lease (Success)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Release Lease (Success)": {
+      "main": [
+        [
+          {
+            "node": "Build Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": null,
+  "meta": null,
+  "tags": [],
+  "id": "7jpRkWpaqT1aX9C2"
+}
