@@ -1,0 +1,544 @@
+{
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Reserve And Apply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Rejected Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserve And Apply": {
+      "main": [
+        [
+          {
+            "node": "Classify Reserve Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Reserve Result": {
+      "main": [
+        [
+          {
+            "node": "Needs Send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Send?": {
+      "main": [
+        [
+          {
+            "node": "Build Send Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Status Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Send Request": {
+      "main": [
+        [
+          {
+            "node": "Send Request Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Request Valid?": {
+      "main": [
+        [
+          {
+            "node": "Call Sender",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Invalid Send Request Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Sender": {
+      "main": [
+        [
+          {
+            "node": "Classify Send Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Send Result": {
+      "main": [
+        [
+          {
+            "node": "Finalize Send Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Send Result": {
+      "main": [
+        [
+          {
+            "node": "Build Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "id": "QDLVryToKn8qeJdWZv3x",
+  "meta": null,
+  "name": "Customer Quotation Delivery",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "idempotencyKey",
+              "type": "string"
+            },
+            {
+              "name": "quotationId",
+              "type": "string"
+            },
+            {
+              "name": "expectedVersion",
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "trigger",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "content": "## Customer Quotation Delivery\\n\\n- **Delivers an already-approved quotation** created and approved by the quotation-owning business application. This workflow does not create quotations, does not calculate prices/tax/totals, and does not generate a PDF or any legally authoritative quotation document.\\n- **recipientPhone, quotation number, amount, currency, valid-until date, and link token are NOT caller inputs.** All read exclusively from Postgres (`quotations`) -- arbitrary caller data can never redirect or fabricate a quotation delivery.\\n- **The quotation link is never a caller- or database-supplied full URL.** It is always `<fixed hardcoded HTTPS origin>` + an opaque, strictly-validated token read from Postgres -- there is no host/scheme/userinfo for a caller or a compromised database row to redirect.\\n- **Idempotency reservation and the eligibility decision happen in ONE atomic PL/pgSQL function** (`process_quotation_delivery`), and finalize verifies exact idempotency-key ownership before mutating anything -- modeled on the corrected, adversarially-tested pattern in `unpaid-invoice-reminder`.\\n- **Only genuinely approved, non-expired, not-already-delivered quotations reach the sender.**\\n- **No automatic retries anywhere in this workflow.**",
+        "height": 480,
+        "width": 680
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -720
+      ],
+      "id": "scopeNote",
+      "name": "Scope Notes"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Validates a quotation-delivery request. Does NOT decide whether a\n// quotation is worth delivering -- that decision (that this quotation was\n// approved and should be sent now) lives entirely outside this workflow.\n//\n// recipientPhone/quotationNumber/amount/currency/validUntil/linkToken are\n// NOT input fields -- read exclusively from Postgres (quotations) later in\n// this workflow. Accepting them from the caller would let arbitrary\n// caller-controlled data redirect a delivery, fabricate an amount, or\n// forge a quotation link; Postgres is the source of truth for all of them.\n\nconst input = $input.first().json;\n\nfunction isValidOpaqueId(v, maxLength) {\n  return typeof v === 'string' && v.length >= 1 && v.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(v);\n}\nfunction isValidExpectedVersion(v) {\n  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 1000000000;\n}\n\nconst idempotencyKey = input.idempotencyKey;\nconst quotationId = input.quotationId;\nconst expectedVersion = input.expectedVersion;\n\nconst idempotencyKeyValid = isValidOpaqueId(idempotencyKey, 128);\nconst quotationIdValid = isValidOpaqueId(quotationId, 128);\nconst expectedVersionValid = isValidExpectedVersion(expectedVersion);\n\nconst valid = idempotencyKeyValid && quotationIdValid && expectedVersionValid;\n\nif (!valid) {\n  return [{ json: {\n    _route: 'rejected',\n    quotationId: quotationIdValid ? quotationId : null,\n  } }];\n}\n\nreturn [{ json: {\n  _route: 'valid',\n  idempotencyKey, quotationId, expectedVersion,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "id": "validateInput",
+      "name": "Validate Input"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "valid",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        520,
+        0
+      ],
+      "id": "ifValid",
+      "name": "Input Valid?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only when input validation failed -- zero database and zero\n// sender-workflow calls were made, structurally guaranteed (this node only\n// runs from the \"Input Valid?\" IF node's false output, before any Postgres\n// or Execute Workflow node in this workflow).\n\nconst item = $input.first().json;\nreturn [{ json: {\n  status: 'rejected',\n  quotationId: item.quotationId,\n  httpStatus: null,\n  providerMessageId: null,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ],
+      "id": "buildRejected",
+      "name": "Build Rejected Response"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM process_quotation_delivery($1, $2, $3);\n",
+        "options": {
+          "queryReplacement": "={{ [$json.idempotencyKey, $json.quotationId, $json.expectedVersion] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        780,
+        -160
+      ],
+      "id": "reserveApply",
+      "name": "Reserve And Apply"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Classifies process_quotation_delivery(...)'s result. `route` is one of:\n//   'owner_applied'       -- this call owns the idempotency reservation;\n//                            result_status is the actual outcome (which\n//                            may itself be terminal, or 'delivery_pending'\n//                            if a sender call is still needed).\n//   'duplicate_match'     -- idempotencyKey already reserved by an\n//                            IDENTICAL prior request (same quotationId) --\n//                            result_status is that prior request's real,\n//                            durable outcome.\n//   'idempotency_mismatch'-- idempotencyKey already reserved by a\n//                            DIFFERENT quotationId -- zero mutation of any\n//                            quotation occurred for this call.\n//\n// Every route except \"owner_applied with result_status = delivery_pending\"\n// is immediately terminal -- no sender call is ever reachable from this\n// node except via that one specific path.\n//\n// Defense in depth: result_status is allowlist-checked before it can ever\n// become part of this workflow's controlled output -- an unrecognized\n// value becomes a fixed literal, never an arbitrary database value\n// surfaced verbatim.\n\nconst KNOWN_STATUSES = new Set([\n  'missing_quotation', 'conflict', 'draft', 'cancelled', 'rejected', 'accepted',\n  'expired', 'already_delivered', 'delivery_pending', 'sent', 'failed',\n  'reconciliation_required', 'idempotency_mismatch', 'invalid_database_state',\n]);\nfunction sanitizeStatus(v) {\n  return (typeof v === 'string' && KNOWN_STATUSES.has(v)) ? v : 'invalid_database_state';\n}\n\nconst result = $input.first().json;\nconst validated = $('Validate Input').first().json;\n\nconst resultStatus = sanitizeStatus(result.result_status);\nconst needsSend = result.route === 'owner_applied' && resultStatus === 'delivery_pending';\n\nreturn [{ json: {\n  _route: needsSend ? 'needs_send' : 'finalized',\n  resultStatus,\n  idempotencyKey: validated.idempotencyKey,\n  quotationId: validated.quotationId,\n  expectedVersion: validated.expectedVersion,\n  recipientPhone: result.out_recipient_phone,\n  quotationNumber: result.out_quotation_number,\n  totalMinorUnits: result.out_total_minor_units,\n  currency: result.out_currency,\n  validUntil: result.out_valid_until,\n  linkToken: result.out_link_token,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        -160
+      ],
+      "id": "classifyReserve",
+      "name": "Classify Reserve Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "needs_send",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1300,
+        -160
+      ],
+      "id": "ifNeedsSend",
+      "name": "Needs Send?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached for: duplicate replays, idempotency mismatches, missing\n// quotations, version conflicts, draft/cancelled/rejected/accepted\n// quotations, expired quotations, and already-delivered/pending\n// deliveries. None of these paths reach the sender sub-workflow --\n// structurally guaranteed by the IF node that routes here.\n\nconst classified = $('Classify Reserve Result').first().json;\n\nreturn [{ json: {\n  status: classified.resultStatus,\n  quotationId: classified.quotationId,\n  httpStatus: null,\n  providerMessageId: null,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        140
+      ],
+      "id": "buildStatusResponse",
+      "name": "Build Status Response"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Builds the sender sub-workflow's request for confirmed-eligible\n// deliveries only -- reached only after Postgres durably recorded\n// 'delivery_pending' for this quotation. recipientPhone and every quote\n// value come EXCLUSIVELY from Postgres (read back from the atomic\n// reservation call) -- never from caller input. templateName,\n// languageCode, graphApiVersion, and phoneNumberId are all trusted,\n// hardcoded configuration -- not caller input.\n//\n// The quotation link is NEVER a caller- or database-supplied full URL --\n// it is always this fixed HTTPS origin plus the opaque, already\n// CHECK-constrained linkToken read from Postgres, re-validated here as\n// defense in depth before ever being used to build a URL. There is no\n// host/scheme/userinfo a compromised database row could use to redirect\n// this link anywhere else.\n//\n// Money is formatted from integer minor units using pure string/integer\n// manipulation -- never JavaScript floating-point division -- see\n// formatMinorUnits below.\n\nconst c = $input.first().json;\n\n// Replace with your own real values before use -- see Setup steps.\nconst GRAPH_API_VERSION = 'v21.0';\nconst PHONE_NUMBER_ID = '000000000000000';\nconst TEMPLATE_NAME = 'customer_quotation_delivery';\nconst LANGUAGE_CODE = 'en';\nconst QUOTATION_LINK_ORIGIN = 'https://quotes.example.com/q/';\n\nfunction isValidLinkToken(v) {\n  return typeof v === 'string' && v.length >= 16 && v.length <= 128 && /^[A-Za-z0-9_-]+$/.test(v);\n}\n\nfunction formatMinorUnits(minorUnits) {\n  // Postgres BIGINT columns are returned by the driver as a numeric\n  // STRING, not a JS number, specifically to avoid silent precision loss\n  // for values near/above Number.MAX_SAFE_INTEGER -- both shapes are\n  // accepted here, but formatting itself is always pure string slicing,\n  // never a numeric division, regardless of which shape arrived.\n  let s;\n  if (typeof minorUnits === 'number' && Number.isInteger(minorUnits) && Number.isSafeInteger(minorUnits) && minorUnits >= 0) {\n    s = String(minorUnits);\n  } else if (typeof minorUnits === 'string' && /^[0-9]{1,15}$/.test(minorUnits)) {\n    s = minorUnits;\n  } else {\n    return null;\n  }\n  const padded = s.padStart(3, '0');\n  const whole = padded.slice(0, -2);\n  const frac = padded.slice(-2);\n  return whole + '.' + frac;\n}\n\nif (!isValidLinkToken(c.linkToken)) {\n  // Fail closed -- never build or send a link from an unvalidated token.\n  return [{ json: { _route: 'invalid_link', quotationId: c.quotationId } }];\n}\n\nconst formattedTotal = formatMinorUnits(c.totalMinorUnits);\nif (formattedTotal === null) {\n  return [{ json: { _route: 'invalid_amount', quotationId: c.quotationId } }];\n}\n\nconst quotationLink = QUOTATION_LINK_ORIGIN + encodeURIComponent(c.linkToken);\n\nreturn [{ json: {\n  _route: 'valid',\n  idempotencyKey: c.idempotencyKey,\n  quotationId: c.quotationId,\n  recipientPhone: c.recipientPhone,\n  templateName: TEMPLATE_NAME,\n  languageCode: LANGUAGE_CODE,\n  graphApiVersion: GRAPH_API_VERSION,\n  phoneNumberId: PHONE_NUMBER_ID,\n  bodyParameters: [c.quotationNumber, formattedTotal, c.currency, c.validUntil, quotationLink],\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        -320
+      ],
+      "id": "buildSendRequest",
+      "name": "Build Send Request"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "valid",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1820,
+        -320
+      ],
+      "id": "ifSendRequestValid",
+      "name": "Send Request Valid?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only if Postgres returned a linkToken or totalMinorUnits that\n// somehow fails this workflow's own defense-in-depth re-validation despite\n// the database's own CHECK constraints -- structurally should be\n// unreachable in normal operation, but fails closed rather than ever\n// building a request from unvalidated data. Zero sender calls occur.\n\nconst item = $input.first().json;\nreturn [{ json: {\n  status: 'invalid_database_state',\n  quotationId: item.quotationId,\n  httpStatus: null,\n  providerMessageId: null,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        0
+      ],
+      "id": "buildInvalidSendRequest",
+      "name": "Build Invalid Send Request Result"
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "mode": "id",
+          "value": "R1QDUW9jYqxREyDS",
+          "cachedResultName": "WhatsApp Template Message Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "recipientPhone": "={{ $json.recipientPhone }}",
+            "templateName": "={{ $json.templateName }}",
+            "languageCode": "={{ $json.languageCode }}",
+            "graphApiVersion": "={{ $json.graphApiVersion }}",
+            "phoneNumberId": "={{ $json.phoneNumberId }}",
+            "bodyParameters": "={{ $json.bodyParameters }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "recipientPhone",
+              "displayName": "recipientPhone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "templateName",
+              "displayName": "templateName",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "languageCode",
+              "displayName": "languageCode",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "graphApiVersion",
+              "displayName": "graphApiVersion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "phoneNumberId",
+              "displayName": "phoneNumberId",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "bodyParameters",
+              "displayName": "bodyParameters",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "array"
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2080,
+        -420
+      ],
+      "id": "callSender",
+      "name": "Call Sender"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Classifies the sender sub-workflow's own controlled output\n// ({status, httpStatus, providerMessageId} -- see\n// whatsapp-template-message-sender.json). A send is only ever treated as\n// successful when EVERY field is mutually consistent -- status exactly\n// 'sent', httpStatus a genuine 2xx integer, and providerMessageId a\n// non-empty, bounded, safely-charactered identifier. The sender can\n// return status:'sent' with a null providerMessageId for a malformed 2xx\n// provider response (missing `messages` field) -- that is a malformed\n// send, not a genuine one, and must never be recorded as sent.\n\nfunction isValidProviderMessageId(v) {\n  return typeof v === 'string' && v.length >= 1 && v.length <= 256 && /^[A-Za-z0-9_.=-]+$/.test(v);\n}\n\nconst resp = $input.first().json;\nconst req = $('Build Send Request').first().json;\n\nconst httpStatusValid = typeof resp.httpStatus === 'number' && Number.isInteger(resp.httpStatus);\nconst httpStatusOk = httpStatusValid && resp.httpStatus >= 200 && resp.httpStatus < 300;\nconst providerMessageIdValid = isValidProviderMessageId(resp.providerMessageId);\n\n// Every field must agree before this counts as a genuine success.\nconst sentValid = resp.status === 'sent' && httpStatusOk && providerMessageIdValid;\nconst outcome = sentValid ? 'sent' : 'failed';\n\nreturn [{ json: {\n  outcome,\n  idempotencyKey: req.idempotencyKey,\n  quotationId: req.quotationId,\n  httpStatus: httpStatusValid ? resp.httpStatus : null,\n  // Non-sent (and internally-inconsistent sent-shaped) outcomes never\n  // retain a provider message id -- there is nothing genuinely confirmed.\n  providerMessageId: sentValid ? resp.providerMessageId : null,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        -420
+      ],
+      "id": "classifySendResult",
+      "name": "Classify Send Result"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM finalize_quotation_delivery($1, $2, $3, $4);\n",
+        "options": {
+          "queryReplacement": "={{ [$json.idempotencyKey, $json.quotationId, $json.outcome, $json.providerMessageId] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2600,
+        -420
+      ],
+      "id": "finalize",
+      "name": "Finalize Send Result"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached after the ownership-verified, version-guarded finalize write.\n// If ownership no longer matches (a newer attempt already owns this\n// quotation, or the quotation moved on since this attempt's reservation),\n// the result is 'reconciliation_required' -- never falsely reported as\n// full success -- and the newer/current state was never touched. A replay\n// against an already-terminal attempt returns that attempt's real,\n// existing result, never flips it.\n//\n// Defense in depth: out_result_status is allowlist-checked before\n// becoming this workflow's controlled `status` -- an unrecognized value\n// becomes a fixed literal, never an arbitrary database value surfaced\n// verbatim.\n\nconst KNOWN_STATUSES = new Set([\n  'sent', 'failed', 'reconciliation_required', 'invalid_database_state',\n  'finalize_unknown_key', 'finalize_mismatch', 'finalize_invalid_outcome',\n]);\nfunction sanitizeStatus(v) {\n  return (typeof v === 'string' && KNOWN_STATUSES.has(v)) ? v : 'invalid_database_state';\n}\n\nconst finalizeResult = $input.first().json;\nconst classified = $('Classify Send Result').first().json;\n\nreturn [{ json: {\n  status: sanitizeStatus(finalizeResult.out_result_status),\n  quotationId: classified.quotationId,\n  httpStatus: classified.httpStatus,\n  providerMessageId: classified.providerMessageId,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        -420
+      ],
+      "id": "buildFinalizeResponse",
+      "name": "Build Finalize Response"
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": null,
+  "tags": []
+}
