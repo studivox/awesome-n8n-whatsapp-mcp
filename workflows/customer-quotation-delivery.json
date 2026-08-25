@@ -26,7 +26,7 @@
       "main": [
         [
           {
-            "node": "Reserve And Apply",
+            "node": "Load Configuration",
             "type": "main",
             "index": 0
           }
@@ -34,6 +34,35 @@
         [
           {
             "node": "Build Rejected Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Configuration": {
+      "main": [
+        [
+          {
+            "node": "Configuration Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuration Valid?": {
+      "main": [
+        [
+          {
+            "node": "Reserve And Apply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Configuration Rejected Response",
             "type": "main",
             "index": 0
           }
@@ -255,6 +284,68 @@
     },
     {
       "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Single authoritative source for this workflow's trusted, hardcoded\n// deployment configuration -- WhatsApp/Graph API settings and the\n// quotation-link origin. Every other node that needs one of these values\n// reads it from THIS node's output rather than re-declaring it, so the\n// two can never diverge.\n//\n// A syntactically valid but still-a-placeholder configuration value (most\n// importantly QUOTATION_LINK_ORIGIN) must never silently reach a real\n// WhatsApp send -- a forgotten placeholder would send a real customer a\n// broken link. Validated BEFORE any Postgres call: a misconfigured\n// deployment makes zero database mutations and zero sender calls, rather\n// than reserving a real quotation against a link nobody can ever open.\n\nconst input = $input.first().json;\n\n// Replace every one of these with your own real values before use --\n// see Setup steps. The shipped defaults are placeholders and are\n// deliberately rejected below until replaced.\nconst GRAPH_API_VERSION = 'v21.0';\nconst PHONE_NUMBER_ID = '000000000000000';\nconst TEMPLATE_NAME = 'customer_quotation_delivery';\nconst LANGUAGE_CODE = 'en';\nconst QUOTATION_LINK_ORIGIN = 'https://quotes.example.com/q/';\n\nconst PLACEHOLDER_PHONE_NUMBER_IDS = new Set(['000000000000000']);\nconst PLACEHOLDER_ORIGIN_HOSTS = new Set([\n  'quotes.example.com', 'example.com', 'example.org', 'example.net',\n  'localhost', '127.0.0.1',\n]);\n\nfunction isValidOrigin(origin) {\n  // A fixed HTTPS origin, no username/password/query/fragment/port, and\n  // not one of the reserved example/placeholder hosts -- must end in '/'\n  // so the token can be safely appended as its own path segment. Parsed\n  // with a plain, bounded regex, deliberately NOT the URL global -- n8n's\n  // Code node sandbox does not expose it by default (confirmed by direct\n  // execution: `typeof URL` is 'undefined' there even though it is a\n  // normal global in a plain Node.js process). The regex's character\n  // classes structurally exclude '@' (userinfo), ':' (port), '?' (query),\n  // and '#' (fragment) from ever being part of a match at all -- there is\n  // no host/scheme confusion for a malformed value to exploit.\n  if (typeof origin !== 'string') return false;\n  const m = /^https:\\/\\/([A-Za-z0-9.-]+)((?:\\/[A-Za-z0-9._-]+)*\\/)$/.exec(origin);\n  if (!m) return false;\n  const host = m[1].toLowerCase();\n  if (PLACEHOLDER_ORIGIN_HOSTS.has(host)) return false;\n  return true;\n}\n\nconst configValid =\n  typeof PHONE_NUMBER_ID === 'string' && !PLACEHOLDER_PHONE_NUMBER_IDS.has(PHONE_NUMBER_ID) &&\n  isValidOrigin(QUOTATION_LINK_ORIGIN);\n\nif (!configValid) {\n  return [{ json: {\n    _route: 'config_invalid',\n    quotationId: input.quotationId,\n  } }];\n}\n\nreturn [{ json: {\n  _route: 'config_valid',\n  idempotencyKey: input.idempotencyKey,\n  quotationId: input.quotationId,\n  expectedVersion: input.expectedVersion,\n  config: {\n    graphApiVersion: GRAPH_API_VERSION,\n    phoneNumberId: PHONE_NUMBER_ID,\n    templateName: TEMPLATE_NAME,\n    languageCode: LANGUAGE_CODE,\n    quotationLinkOrigin: QUOTATION_LINK_ORIGIN,\n  },\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        -160
+      ],
+      "id": "loadConfiguration",
+      "name": "Load Configuration"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "config_valid",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1040,
+        -160
+      ],
+      "id": "ifConfigValid",
+      "name": "Configuration Valid?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only when this workflow's own hardcoded deployment\n// configuration (WhatsApp/Graph API settings, the quotation-link origin)\n// is missing or still a shipped placeholder -- structurally guaranteed to\n// run before any Postgres call in this workflow. Zero database\n// mutations, zero sender calls.\n\nconst item = $input.first().json;\nreturn [{ json: {\n  status: 'configuration_required',\n  quotationId: item.quotationId,\n  httpStatus: null,\n  providerMessageId: null,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        140
+      ],
+      "id": "buildConfigRejected",
+      "name": "Build Configuration Rejected Response"
+    },
+    {
+      "parameters": {
         "operation": "executeQuery",
         "query": "SELECT * FROM process_quotation_delivery($1, $2, $3);\n",
         "options": {
@@ -264,7 +355,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
       "position": [
-        780,
+        1300,
         -160
       ],
       "id": "reserveApply",
@@ -279,7 +370,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1040,
+        1560,
         -160
       ],
       "id": "classifyReserve",
@@ -311,7 +402,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        1300,
+        1820,
         -160
       ],
       "id": "ifNeedsSend",
@@ -326,7 +417,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1560,
+        2080,
         140
       ],
       "id": "buildStatusResponse",
@@ -336,12 +427,12 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// Builds the sender sub-workflow's request for confirmed-eligible\n// deliveries only -- reached only after Postgres durably recorded\n// 'delivery_pending' for this quotation. recipientPhone and every quote\n// value come EXCLUSIVELY from Postgres (read back from the atomic\n// reservation call) -- never from caller input. templateName,\n// languageCode, graphApiVersion, and phoneNumberId are all trusted,\n// hardcoded configuration -- not caller input.\n//\n// The quotation link is NEVER a caller- or database-supplied full URL --\n// it is always this fixed HTTPS origin plus the opaque, already\n// CHECK-constrained linkToken read from Postgres, re-validated here as\n// defense in depth before ever being used to build a URL. There is no\n// host/scheme/userinfo a compromised database row could use to redirect\n// this link anywhere else.\n//\n// Money is formatted from integer minor units using pure string/integer\n// manipulation -- never JavaScript floating-point division -- see\n// formatMinorUnits below.\n\nconst c = $input.first().json;\n\n// Replace with your own real values before use -- see Setup steps.\nconst GRAPH_API_VERSION = 'v21.0';\nconst PHONE_NUMBER_ID = '000000000000000';\nconst TEMPLATE_NAME = 'customer_quotation_delivery';\nconst LANGUAGE_CODE = 'en';\nconst QUOTATION_LINK_ORIGIN = 'https://quotes.example.com/q/';\n\nfunction isValidLinkToken(v) {\n  return typeof v === 'string' && v.length >= 16 && v.length <= 128 && /^[A-Za-z0-9_-]+$/.test(v);\n}\n\nfunction formatMinorUnits(minorUnits) {\n  // Postgres BIGINT columns are returned by the driver as a numeric\n  // STRING, not a JS number, specifically to avoid silent precision loss\n  // for values near/above Number.MAX_SAFE_INTEGER -- both shapes are\n  // accepted here, but formatting itself is always pure string slicing,\n  // never a numeric division, regardless of which shape arrived.\n  let s;\n  if (typeof minorUnits === 'number' && Number.isInteger(minorUnits) && Number.isSafeInteger(minorUnits) && minorUnits >= 0) {\n    s = String(minorUnits);\n  } else if (typeof minorUnits === 'string' && /^[0-9]{1,15}$/.test(minorUnits)) {\n    s = minorUnits;\n  } else {\n    return null;\n  }\n  const padded = s.padStart(3, '0');\n  const whole = padded.slice(0, -2);\n  const frac = padded.slice(-2);\n  return whole + '.' + frac;\n}\n\nif (!isValidLinkToken(c.linkToken)) {\n  // Fail closed -- never build or send a link from an unvalidated token.\n  return [{ json: { _route: 'invalid_link', quotationId: c.quotationId } }];\n}\n\nconst formattedTotal = formatMinorUnits(c.totalMinorUnits);\nif (formattedTotal === null) {\n  return [{ json: { _route: 'invalid_amount', quotationId: c.quotationId } }];\n}\n\nconst quotationLink = QUOTATION_LINK_ORIGIN + encodeURIComponent(c.linkToken);\n\nreturn [{ json: {\n  _route: 'valid',\n  idempotencyKey: c.idempotencyKey,\n  quotationId: c.quotationId,\n  recipientPhone: c.recipientPhone,\n  templateName: TEMPLATE_NAME,\n  languageCode: LANGUAGE_CODE,\n  graphApiVersion: GRAPH_API_VERSION,\n  phoneNumberId: PHONE_NUMBER_ID,\n  bodyParameters: [c.quotationNumber, formattedTotal, c.currency, c.validUntil, quotationLink],\n} }];\n"
+        "jsCode": "// Builds the sender sub-workflow's request for confirmed-eligible\n// deliveries only -- reached only after Postgres durably recorded\n// 'delivery_pending' for this quotation. recipientPhone and every quote\n// value come EXCLUSIVELY from Postgres (read back from the atomic\n// reservation call) -- never from caller input. templateName,\n// languageCode, graphApiVersion, and phoneNumberId are all trusted,\n// hardcoded configuration -- not caller input.\n//\n// The quotation link is NEVER a caller- or database-supplied full URL --\n// it is always this fixed HTTPS origin plus the opaque, already\n// CHECK-constrained linkToken read from Postgres, re-validated here as\n// defense in depth before ever being used to build a URL. There is no\n// host/scheme/userinfo a compromised database row could use to redirect\n// this link anywhere else.\n//\n// Money is formatted from integer minor units using pure string/integer\n// manipulation -- never JavaScript floating-point division -- see\n// formatMinorUnits below.\n//\n// Every configuration value below is read from \"Load Configuration\" --\n// the single authoritative, already-validated source for this workflow's\n// trusted deployment settings -- never re-declared here, so the two can\n// never diverge.\n\nconst c = $input.first().json;\nconst config = $('Load Configuration').first().json.config;\n\nconst GRAPH_API_VERSION = config.graphApiVersion;\nconst PHONE_NUMBER_ID = config.phoneNumberId;\nconst TEMPLATE_NAME = config.templateName;\nconst LANGUAGE_CODE = config.languageCode;\nconst QUOTATION_LINK_ORIGIN = config.quotationLinkOrigin;\n\nfunction isValidLinkToken(v) {\n  return typeof v === 'string' && v.length >= 16 && v.length <= 128 && /^[A-Za-z0-9_-]+$/.test(v);\n}\n\nfunction formatMinorUnits(minorUnits) {\n  // Postgres BIGINT columns are returned by the driver as a numeric\n  // STRING, not a JS number, specifically to avoid silent precision loss\n  // for values near/above Number.MAX_SAFE_INTEGER -- both shapes are\n  // accepted here, but formatting itself is always pure string slicing,\n  // never a numeric division, regardless of which shape arrived.\n  let s;\n  if (typeof minorUnits === 'number' && Number.isInteger(minorUnits) && Number.isSafeInteger(minorUnits) && minorUnits >= 0) {\n    s = String(minorUnits);\n  } else if (typeof minorUnits === 'string' && /^[0-9]{1,15}$/.test(minorUnits)) {\n    s = minorUnits;\n  } else {\n    return null;\n  }\n  const padded = s.padStart(3, '0');\n  const whole = padded.slice(0, -2);\n  const frac = padded.slice(-2);\n  return whole + '.' + frac;\n}\n\nif (!isValidLinkToken(c.linkToken)) {\n  // Fail closed -- never build or send a link from an unvalidated token.\n  return [{ json: { _route: 'invalid_link', quotationId: c.quotationId } }];\n}\n\nconst formattedTotal = formatMinorUnits(c.totalMinorUnits);\nif (formattedTotal === null) {\n  return [{ json: { _route: 'invalid_amount', quotationId: c.quotationId } }];\n}\n\nconst quotationLink = QUOTATION_LINK_ORIGIN + encodeURIComponent(c.linkToken);\n\nreturn [{ json: {\n  _route: 'valid',\n  idempotencyKey: c.idempotencyKey,\n  quotationId: c.quotationId,\n  recipientPhone: c.recipientPhone,\n  templateName: TEMPLATE_NAME,\n  languageCode: LANGUAGE_CODE,\n  graphApiVersion: GRAPH_API_VERSION,\n  phoneNumberId: PHONE_NUMBER_ID,\n  bodyParameters: [c.quotationNumber, formattedTotal, c.currency, c.validUntil, quotationLink],\n} }];\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1560,
+        2080,
         -320
       ],
       "id": "buildSendRequest",
@@ -373,7 +464,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        1820,
+        2340,
         -320
       ],
       "id": "ifSendRequestValid",
@@ -388,7 +479,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2080,
+        2600,
         0
       ],
       "id": "buildInvalidSendRequest",
@@ -477,7 +568,7 @@
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1.2,
       "position": [
-        2080,
+        2600,
         -420
       ],
       "id": "callSender",
@@ -492,7 +583,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2340,
+        2860,
         -420
       ],
       "id": "classifySendResult",
@@ -509,7 +600,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
       "position": [
-        2600,
+        3120,
         -420
       ],
       "id": "finalize",
@@ -519,12 +610,12 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// Reached after the ownership-verified, version-guarded finalize write.\n// If ownership no longer matches (a newer attempt already owns this\n// quotation, or the quotation moved on since this attempt's reservation),\n// the result is 'reconciliation_required' -- never falsely reported as\n// full success -- and the newer/current state was never touched. A replay\n// against an already-terminal attempt returns that attempt's real,\n// existing result, never flips it.\n//\n// Defense in depth: out_result_status is allowlist-checked before\n// becoming this workflow's controlled `status` -- an unrecognized value\n// becomes a fixed literal, never an arbitrary database value surfaced\n// verbatim.\n\nconst KNOWN_STATUSES = new Set([\n  'sent', 'failed', 'reconciliation_required', 'invalid_database_state',\n  'finalize_unknown_key', 'finalize_mismatch', 'finalize_invalid_outcome',\n]);\nfunction sanitizeStatus(v) {\n  return (typeof v === 'string' && KNOWN_STATUSES.has(v)) ? v : 'invalid_database_state';\n}\n\nconst finalizeResult = $input.first().json;\nconst classified = $('Classify Send Result').first().json;\n\nreturn [{ json: {\n  status: sanitizeStatus(finalizeResult.out_result_status),\n  quotationId: classified.quotationId,\n  httpStatus: classified.httpStatus,\n  providerMessageId: classified.providerMessageId,\n} }];\n"
+        "jsCode": "// Reached after the ownership-verified, version-guarded finalize write.\n// If ownership no longer matches (a newer attempt already owns this\n// quotation, or the quotation moved on since this attempt's reservation),\n// the result is 'reconciliation_required' -- never falsely reported as\n// full success -- and the newer/current state was never touched. A replay\n// against an already-terminal attempt returns that attempt's real,\n// existing result, never flips it.\n//\n// Defense in depth: out_result_status is allowlist-checked before\n// becoming this workflow's controlled `status` -- an unrecognized value\n// becomes a fixed literal, never an arbitrary database value surfaced\n// verbatim.\n\nconst KNOWN_STATUSES = new Set([\n  'sent', 'failed', 'reconciliation_required', 'invalid_database_state',\n  'finalize_unknown_key', 'finalize_mismatch', 'finalize_invalid_outcome',\n  'finalize_invalid_provider_message_id',\n]);\nfunction sanitizeStatus(v) {\n  return (typeof v === 'string' && KNOWN_STATUSES.has(v)) ? v : 'invalid_database_state';\n}\n\nconst finalizeResult = $input.first().json;\nconst classified = $('Classify Send Result').first().json;\n\nreturn [{ json: {\n  status: sanitizeStatus(finalizeResult.out_result_status),\n  quotationId: classified.quotationId,\n  httpStatus: classified.httpStatus,\n  providerMessageId: classified.providerMessageId,\n} }];\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2860,
+        3380,
         -420
       ],
       "id": "buildFinalizeResponse",
