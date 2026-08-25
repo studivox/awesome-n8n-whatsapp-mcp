@@ -195,6 +195,14 @@ Every finalize call (`sync_outbox_finalize`) is lease-guarded the same way the p
 
 **This workflow never claims atomicity across Postgres and Google Calendar** — it's structurally impossible, and every design choice above (idempotency keys, conditional requests, lease-guarded finalize, staleness-based reclaim, fail-closed validation before every mutating call) exists specifically to make the *un-atomic* gap between "Calendar call happened" and "Postgres recorded it" safe to retry or safe to leave for reconciliation, never silently wrong.
 
+## Finalize-guard correction
+
+**What was missing:** `sync_outbox_finalize_success`/`_conflict`/`_failure` verified the caller's *lease* before writing, but not that the specific `sync_outbox` row identified by `p_outbox_id` still existed and was still `in_flight`. Each finalize call's `UPDATE sync_outbox ... WHERE o.id = p_outbox_id` had no `AND status = 'in_flight'` guard and no check that it actually matched a row before going on to mutate `appointment_calendar_mappings` (and, for conflicts, insert into `sync_conflicts`). In real operation this is not externally reachable — `p_outbox_id` is never caller input, only ever a value this same execution obtained from its own `Claim Outbox Batch` call, and the lease check already prevents a different owner from finalizing at all — but it meant a second finalize call against the same already-finalized row (e.g. a latent bug in a future caller, or a manual `psql` mistake) would silently re-apply mapping changes a second time instead of being rejected.
+
+**The fix:** every finalize function's outbox `UPDATE` now also requires `o.calendar_id = p_calendar_id AND o.status = 'in_flight'`, and checks `FOUND` before doing anything else — `sync_outbox_finalize_success` returns `(false, 'outbox_row_not_in_flight')` and touches no other table if the row wasn't there to finalize. Verified directly against Postgres: a finalize call against a nonexistent outbox id, and a second finalize call replaying an already-`applied` row's id, are both now rejected (`out_ok = false`) with the mapping and `sync_outbox` row left exactly as they were; a genuine first finalize of a real `in_flight` row is unaffected.
+
+**Also corrected:** `Accumulate Outbox Results` counted every `outcome === 'conflict'` item as `conflicted` regardless of whether its finalize call actually succeeded — so a conflict finalize that itself returned `out_ok = false` (lease lost mid-drain, or now also `outbox_row_not_in_flight`) was reported in the summary as conflicted even though nothing was actually written. Fixed to require `ok` for the conflict branch too, matching the existing `success` branch's own `ok` check.
+
 ## Crash-consistency results
 
 | Crash point | Result |
@@ -493,7 +501,13 @@ BEGIN
     RETURN;
   END IF;
 
-  UPDATE sync_outbox o SET status = 'conflict', last_error = p_reason, updated_at = now() WHERE o.id = p_outbox_id;
+  UPDATE sync_outbox o SET status = 'conflict', last_error = p_reason, updated_at = now()
+    WHERE o.id = p_outbox_id AND o.calendar_id = p_calendar_id AND o.status = 'in_flight';
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT false;
+    RETURN;
+  END IF;
+
   UPDATE appointment_calendar_mappings m SET sync_status = 'conflict', updated_at = now()
     WHERE m.appointment_id = p_appointment_id AND m.calendar_id = p_calendar_id;
   INSERT INTO sync_conflicts (appointment_id, calendar_id, google_event_id, reason, details)
@@ -516,8 +530,9 @@ BEGIN
     RETURN;
   END IF;
 
-  UPDATE sync_outbox o SET status = 'failed', last_error = p_error, updated_at = now() WHERE o.id = p_outbox_id;
-  RETURN QUERY SELECT true;
+  UPDATE sync_outbox o SET status = 'failed', last_error = p_error, updated_at = now()
+    WHERE o.id = p_outbox_id AND o.calendar_id = p_calendar_id AND o.status = 'in_flight';
+  RETURN QUERY SELECT FOUND;
 END;
 $$
 ;
@@ -551,7 +566,12 @@ BEGIN
 
   UPDATE sync_outbox o
   SET status = 'applied', google_event_id = p_google_event_id, updated_at = now()
-  WHERE o.id = p_outbox_id;
+  WHERE o.id = p_outbox_id AND o.calendar_id = p_calendar_id AND o.status = 'in_flight';
+
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT false, 'outbox_row_not_in_flight'::TEXT;
+    RETURN;
+  END IF;
 
   IF p_operation = 'cancel' THEN
     UPDATE appointment_calendar_mappings m
@@ -872,6 +892,7 @@ If you already installed the schema and functions from an earlier round of this 
    - `sync_process_page` gained page-level and per-item validation, bounded projection, exception-safe per-item handling, and (this round) the pagination-token-contract check. Any `sync_conflicts` rows written by an *older* version of this function may contain full raw event payloads rather than the current five-field allowlist — if this matters for your compliance posture, purge or redact pre-existing `sync_conflicts.details` values written before the data-minimization update.
    - `sync_outbox_finalize` had an ambiguous `out_ok` column reference that made every `conflict`/`failure` outbox finalize call throw a hard Postgres error, aborting the execution rather than resolving the outbox row. If you deployed that earlier version, check for unexpectedly-`in_flight` outbox rows and re-run this workflow after upgrading the function.
    - `sync_outbox_finalize_success` now validates the `updated` timestamp in an exception-safe block before casting, instead of letting a malformed value abort the call.
+   - `sync_outbox_finalize_success`/`_conflict`/`_failure` now also require the target `sync_outbox` row to still be `status = 'in_flight'` before finalizing it (see [Finalize-guard correction](#finalize-guard-correction)) — re-apply these three function bodies along with the rest of the block.
 2. **Add the new `sync_outbox` CHECK constraints** (see [Create-input fail-closed design](#create-input-fail-closed-design) for the full list). Before adding them, check for any existing rows that would violate them (an invalid `operation`, an out-of-range identifier, a non-object or oversized `payload`) — if you have any, either fix or delete those rows first, or add the constraints as `NOT VALID` (skips validating existing rows; still enforced for every new `INSERT`/`UPDATE` from that point on) and reconcile the pre-existing data separately:
    ```sql
    ALTER TABLE sync_outbox
@@ -916,4 +937,4 @@ CC0-1.0 (see [`LICENSE`](../LICENSE)). Original workflow, built for this reposit
 
 ## Last verification date
 
-2026-08-20
+2026-08-25
