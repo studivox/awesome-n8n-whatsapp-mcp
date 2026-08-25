@@ -35,9 +35,9 @@ Built and tested against **n8n v2.35.4**, running on Node.js v22.23.2 (n8n 2.35.
 
 - **Execute Workflow Trigger** (`n8n-nodes-base.executeWorkflowTrigger`, v1.2) — entry point; declares the three-field input contract (no recipient, quotation values, or link).
 - **Sticky Note** (`n8n-nodes-base.stickyNote`, v1) — in-canvas scope notes; not part of execution.
-- **Code** (`n8n-nodes-base.code`, v2) — used ten times: input validation, deployment-configuration loading and validation (`Load Configuration` — the single authoritative source for hardcoded WhatsApp/link-origin settings, fails closed before any Postgres call), the configuration-rejected response builder, reserve-result classification, the status-response builder, the send-request builder (link/money validation and formatting), the invalid-send-request-result builder, send-result classification, and the final finalize-response builder — plus the rejected-input response builder.
+- **Code** (`n8n-nodes-base.code`, v2) — used ten times: input validation, deployment-configuration loading and validation (`Load Configuration` — the single authoritative source for hardcoded WhatsApp/link-origin settings, fails closed before any Postgres call), the configuration-rejected response builder, reserve-result classification, the status-response builder, the send-request builder (link/money validation and formatting), the invalid-send-request-result builder (reads the ownership-verified Postgres cleanup this path performs, see below), send-result classification, and the final finalize-response builder — plus the rejected-input response builder.
 - **IF** (`n8n-nodes-base.if`, v2.3) — used four times: input validity, deployment-configuration validity, whether a send is actually needed, and whether the built send request (link token, formatted amount) itself passed validation before ever reaching the sender.
-- **Postgres** (`n8n-nodes-base.postgres`, v2.6) — used twice (`Reserve And Apply`, `Finalize Send Result`), `Execute Query` operation, every query fully parameterized (`$1, $2, ...` placeholders with a separate values array — never string-built SQL). See [Atomic idempotency and ownership design](#atomic-idempotency-and-ownership-design).
+- **Postgres** (`n8n-nodes-base.postgres`, v2.6) — used three times (`Reserve And Apply`, `Finalize Invalid Send Request`, `Finalize Send Result`), `Execute Query` operation, every query fully parameterized (`$1, $2, ...` placeholders with a separate values array — never string-built SQL). See [Atomic idempotency and ownership design](#atomic-idempotency-and-ownership-design).
 - **Execute Workflow** (`n8n-nodes-base.executeWorkflow`, v1.2) — the single call to the existing [`whatsapp-template-message-sender`](whatsapp-template-message-sender.md) sub-workflow, referenced by its stable, committed workflow id (`R1QDUW9jYqxREyDS`) — the same portable-by-id pattern already established by [`whatsapp-appointment-reminder`](whatsapp-appointment-reminder.md) and [`unpaid-invoice-reminder`](unpaid-invoice-reminder.md). See [Sender sub-workflow binding](#sender-sub-workflow-binding).
 
 All node types are part of n8n core — no community nodes required, and nothing here requires an n8n Enterprise-licensed feature.
@@ -84,24 +84,41 @@ const quotationLink = QUOTATION_LINK_ORIGIN + encodeURIComponent(c.linkToken);
 
 `link_token` is bounded to a strict alphanumeric-plus-underscore-plus-hyphen character set at the database layer (`quotations_link_token_check`, plus a `UNIQUE` constraint — no two quotations can ever share a token) and re-validated identically in `Build Send Request` before ever being used to build a URL — defense in depth, not reliance on the database constraint alone. This character set structurally **cannot** contain a URL scheme (`http://`), a different host, userinfo (`user:pass@`), a port, or a path-traversal sequence (`../`) — there is nothing to allowlist against because none of those characters are ever valid in the first place. Verified directly: a URL-shaped, userinfo-shaped, and path-traversal-shaped token were each rejected by the database `CHECK` constraint at `INSERT` time; a URL-shaped token that bypassed the constraint (dropped temporarily for this test) was still rejected by the n8n-layer validation, with zero calls reaching the sender.
 
-**The origin itself (`QUOTATION_LINK_ORIGIN`) is validated the same way, by a separate `Load Configuration` node that runs before any Postgres call — not just the token.** This closes a real gap found by external review: the shipped placeholder origin is syntactically valid HTTPS, so a deployment that forgot to replace it would otherwise reach a real WhatsApp send carrying a broken `example.com` link. `Load Configuration` is the single authoritative source for this and every other hardcoded deployment constant (`GRAPH_API_VERSION`, `PHONE_NUMBER_ID`, `TEMPLATE_NAME`, `LANGUAGE_CODE`, `QUOTATION_LINK_ORIGIN`) — `Build Send Request` reads all of them from `Load Configuration`'s already-validated output rather than re-declaring its own copies, so the two can never diverge:
+**Every hardcoded deployment constant is validated for format, not just the two with an obvious placeholder value**, by a separate `Load Configuration` node that runs before any Postgres call. `Load Configuration` is the single authoritative source for `GRAPH_API_VERSION`, `PHONE_NUMBER_ID`, `TEMPLATE_NAME`, `LANGUAGE_CODE`, and `QUOTATION_LINK_ORIGIN` — `Build Send Request` reads all of them from `Load Configuration`'s already-validated output rather than re-declaring its own copies, so the two can never diverge. `GRAPH_API_VERSION`/`PHONE_NUMBER_ID`/`TEMPLATE_NAME`/`LANGUAGE_CODE` are each checked against the same format the sender's own `Validate & Build Request` node independently enforces (so a value accepted here can never be one the sender itself would then reject), plus a small placeholder set for `PHONE_NUMBER_ID` (currently just the shipped all-zero value).
+
+**The origin (`QUOTATION_LINK_ORIGIN`) gets the most scrutiny**, since it's syntactically valid HTTPS by construction and a forgotten placeholder would otherwise reach a real WhatsApp send carrying a broken link:
 
 ```js
 function isValidOrigin(origin) {
   if (typeof origin !== 'string') return false;
-  const m = /^https:\/\/([A-Za-z0-9.-]+)((?:\/[A-Za-z0-9._-]+)*\/)$/.exec(origin);
-  if (!m) return false;
-  const host = m[1].toLowerCase();
-  if (PLACEHOLDER_ORIGIN_HOSTS.has(host)) return false;
+  if (origin.indexOf('\\') !== -1) return false;
+  const PREFIX = 'https://';
+  if (origin.slice(0, PREFIX.length) !== PREFIX) return false;
+  const rest = origin.slice(PREFIX.length);
+  const slashIdx = rest.indexOf('/');
+  if (slashIdx === -1) return false;
+  const hostPart = rest.slice(0, slashIdx);
+  const pathPart = rest.slice(slashIdx);
+  if (hostPart.indexOf('@') !== -1) return false;
+  if (hostPart.indexOf(':') !== -1) return false;
+  if (hostPart.indexOf('?') !== -1 || hostPart.indexOf('#') !== -1) return false;
+  if (!isValidHostname(hostPart)) return false;
+  const host = hostPart.toLowerCase();
+  if (host === 'localhost') return false;
+  if (isIpLiteral(host)) return false;
+  if (isReservedExampleHost(host)) return false;
+  if (pathPart.charAt(pathPart.length - 1) !== '/') return false;
+  if (pathPart.indexOf('?') !== -1 || pathPart.indexOf('#') !== -1) return false;
+  if (!/^(\/[A-Za-z0-9._-]+)*\/$/.test(pathPart)) return false;
   return true;
 }
 ```
 
-A fixed HTTPS origin, no username/password/query/fragment/port, not one of the reserved example/placeholder hosts (`example.com`, `example.org`, `example.net`, `quotes.example.com`, `localhost`, `127.0.0.1`), always ending in `/` so the token can be safely appended as its own path segment. The regex's character classes structurally exclude `@` (userinfo), `:` (port), `?` (query), and `#` (fragment) from ever being part of a match at all.
+Fixed HTTPS scheme, no username/password/port/query/fragment/backslash, always ending in `/` so the token can be safely appended as its own path segment. Hostname validity (`isValidHostname`) is checked with plain string splitting and per-label checks — **deliberately not one large nested regex**: each label between dots must be 1–63 characters, letters/digits/hyphen only, never starting or ending with a hyphen; the hostname must have at least two labels and be ASCII, 1–253 characters total. `isIpLiteral` rejects any host containing `:` (an IPv6 literal, or a port already caught earlier) and any bare four-label all-numeric dotted-quad, regardless of whether the numbers are in range. `isReservedExampleHost` rejects `example.com`/`example.org`/`example.net` **and every genuine subdomain of them** (a dot-bounded suffix match, not a naive `endsWith` — `quotesexample.net` is *not* a subdomain of `example.net` and is correctly allowed through).
 
-**This is deliberately implemented with a plain regex, not the `URL` global** — a real portability defect found and fixed live during this correction: an earlier draft used `new URL(origin)`, which threw `ReferenceError: URL is not defined` inside n8n's own Code node execution sandbox (confirmed by direct execution — `typeof URL` is `'undefined'` there, even though `URL` is an ordinary global in a plain Node.js process). Every placeholder-configuration test in [Test procedure](#test-procedure) was run against the real graph, not just the isolated function, specifically because this class of defect is invisible to logic review alone.
+**This is deliberately implemented with plain string operations, not the `URL` global** — a real portability defect found and fixed live during this correction: an earlier draft used `new URL(origin)`, which threw `ReferenceError: URL is not defined` inside n8n's own Code node execution sandbox (confirmed by direct execution — `typeof URL` is `'undefined'` there, even though `URL` is an ordinary global in a plain Node.js process). Every placeholder-configuration test in [Test procedure](#test-procedure) was run against the real graph, not just the isolated function, specifically because this class of defect is invisible to logic review alone.
 
-`PHONE_NUMBER_ID` is checked the same way against a small placeholder set (currently just the shipped all-zero value). A shipped placeholder in either field routes to `Build Configuration Rejected Response` — `configuration_required`, **zero Postgres calls, zero sender calls**, verified directly against the real committed workflow with its shipped defaults untouched.
+A shipped placeholder or malformed value in any field routes to `Build Configuration Rejected Response` — `configuration_required`, **zero Postgres calls, zero sender calls**, verified directly against the real committed workflow with its shipped defaults untouched. Verified with 39 unit cases across all five fields (valid production-shaped values, every shipped placeholder, malformed Graph version/phone-number-id/template-name/language-code, leading/trailing/consecutive-dot hosts, leading/trailing-hyphen labels, `example.com`/`.org`/`.net` and genuine subdomains of them, the `quotesexample.net` lookalike, `localhost`, IPv4/IPv6 literals, userinfo/port/query/fragment/backslash-confusable origins, non-HTTPS, and valid multi-label origins with single- and multi-segment paths) and live against both the real committed workflow (shipped placeholder → `configuration_required`) and a mock-bound copy with a real, non-placeholder configuration (→ a genuine successful send).
 
 **This workflow never fetches or follows the quotation link.** It only passes the validated, constructed link into the sender's `bodyParameters` — the same as any other template parameter — and the sender itself only ever sends it as literal template text to the WhatsApp Business Cloud API, never dereferencing it either.
 
@@ -165,7 +182,8 @@ CREATE TABLE quotations (
   CONSTRAINT quotations_currency_check CHECK (currency ~ '^[A-Z]{3}$'),
   CONSTRAINT quotations_link_token_check CHECK (length(link_token) BETWEEN 16 AND 128 AND link_token ~ '^[A-Za-z0-9_-]+$'),
   CONSTRAINT quotations_link_token_unique UNIQUE (link_token),
-  CONSTRAINT quotations_version_check CHECK (version >= 1 AND version <= 1000000000)
+  CONSTRAINT quotations_version_check CHECK (version >= 1 AND version <= 1000000000),
+  CONSTRAINT quotations_valid_until_finite_check CHECK (isfinite(valid_until))
 );
 
 CREATE TABLE quotation_delivery_state (
@@ -176,7 +194,7 @@ CREATE TABLE quotation_delivery_state (
   provider_message_id     TEXT,
   updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT qds_quotation_id_check CHECK (quotation_id ~ '^[A-Za-z0-9_-]{1,128}$'),
-  CONSTRAINT qds_status_check CHECK (status IN ('delivery_pending', 'sent', 'failed', 'reconciliation_required')),
+  CONSTRAINT qds_status_check CHECK (status IN ('delivery_pending', 'sent', 'failed', 'reconciliation_required', 'invalid_database_state')),
   CONSTRAINT qds_active_key_check CHECK (active_idempotency_key IS NULL OR active_idempotency_key ~ '^[A-Za-z0-9_-]{1,128}$'),
   CONSTRAINT qds_reserved_version_check CHECK (reserved_version IS NULL OR (reserved_version >= 1 AND reserved_version <= 1000000000)),
   CONSTRAINT qds_provider_message_id_check CHECK (provider_message_id IS NULL OR (length(provider_message_id) BETWEEN 1 AND 256 AND provider_message_id ~ '^[A-Za-z0-9_.=-]+$')),
@@ -270,6 +288,23 @@ BEGIN
     RETURN;
   END IF;
 
+  -- Database-layer defense in depth, checked before the expiry comparison
+  -- itself: quotations_valid_until_finite_check already bounds valid_until
+  -- to a finite instant under normal operation, but this function never
+  -- trusts that as the only line of defense. PostgreSQL's timestamptz type
+  -- accepts 'infinity'/'-infinity' as valid values -- 'infinity' is never
+  -- <= now() and would otherwise pass the expiry check below and reach a
+  -- real WhatsApp send as the literal string "infinity"; '-infinity' IS
+  -- always <= now() and would otherwise be mislabeled 'expired' rather
+  -- than honestly reported as corrupt data. Both directions are checked
+  -- here, before the expiry comparison, so neither can slip through under
+  -- either label.
+  IF NOT isfinite(v_quote.valid_until) THEN
+    UPDATE quotation_delivery_events SET result_status = 'invalid_database_state' WHERE idempotency_key = p_idempotency_key;
+    RETURN QUERY SELECT 'owner_applied'::TEXT, 'invalid_database_state'::TEXT, NULL::TEXT, NULL::TEXT, NULL::BIGINT, NULL::TEXT, NULL::TEXT, NULL::TEXT, v_quote.version;
+    RETURN;
+  END IF;
+
   -- Inclusive expiry boundary: a quotation whose valid_until is exactly
   -- "now" is treated as already expired, not as valid for one more instant.
   IF v_quote.valid_until <= now() THEN
@@ -300,6 +335,21 @@ BEGIN
     -- quotation_delivery_state, and never reaches the sender.
     UPDATE quotation_delivery_events SET result_status = 'reconciliation_required' WHERE idempotency_key = p_idempotency_key;
     RETURN QUERY SELECT 'owner_applied'::TEXT, 'reconciliation_required'::TEXT, NULL::TEXT, NULL::TEXT, NULL::BIGINT, NULL::TEXT, NULL::TEXT, NULL::TEXT, v_quote.version;
+    RETURN;
+  END IF;
+
+  IF FOUND AND v_state.status = 'invalid_database_state' THEN
+    -- A quotation left in invalid_database_state (the underlying quote
+    -- data itself was invalid -- see the data-integrity check below, and
+    -- the n8n-layer defense-in-depth cleanup this state also records)
+    -- requires manual correction of the quotation's own data before any
+    -- further delivery attempt -- it must NEVER be silently reopened.
+    -- Distinct from reconciliation_required: zero sender calls ever
+    -- happened here, so there is no "may have already reached WhatsApp"
+    -- ambiguity -- the block exists purely so a human fixes the data
+    -- first, not because the outcome is uncertain.
+    UPDATE quotation_delivery_events SET result_status = 'invalid_database_state' WHERE idempotency_key = p_idempotency_key;
+    RETURN QUERY SELECT 'owner_applied'::TEXT, 'invalid_database_state'::TEXT, NULL::TEXT, NULL::TEXT, NULL::BIGINT, NULL::TEXT, NULL::TEXT, NULL::TEXT, v_quote.version;
     RETURN;
   END IF;
 
@@ -348,7 +398,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION finalize_quotation_delivery(
   p_idempotency_key      TEXT,
   p_quotation_id         TEXT,
-  p_outcome              TEXT,   -- 'sent' | 'failed'
+  p_outcome              TEXT,   -- 'sent' | 'failed' | 'invalid_database_state'
   p_provider_message_id  TEXT
 ) RETURNS TABLE (out_ok BOOLEAN, out_result_status TEXT) AS $$
 DECLARE
@@ -357,7 +407,7 @@ DECLARE
   v_current_version INTEGER;
   v_new_status TEXT;
 BEGIN
-  IF p_outcome NOT IN ('sent', 'failed') THEN
+  IF p_outcome NOT IN ('sent', 'failed', 'invalid_database_state') THEN
     RETURN QUERY SELECT false, 'finalize_invalid_outcome'::TEXT;
     RETURN;
   END IF;
@@ -365,19 +415,22 @@ BEGIN
   -- Never trust the caller's outcome/provider-id pairing on the n8n side
   -- alone -- enforce the same relationship this function's own tables
   -- require (qds_provider_message_id_status_check) as an input-shape gate,
-  -- before touching any row. Mutates nothing.
+  -- before touching any row. Mutates nothing. 'invalid_database_state'
+  -- means no sender call ever happened (the n8n-layer defense-in-depth
+  -- gate rejected the send request before Call Sender), so it carries the
+  -- same null-provider-id requirement as 'failed'.
   IF p_outcome = 'sent' AND (p_provider_message_id IS NULL
       OR NOT (length(p_provider_message_id) BETWEEN 1 AND 256 AND p_provider_message_id ~ '^[A-Za-z0-9_.=-]+$')) THEN
     RETURN QUERY SELECT false, 'finalize_invalid_provider_message_id'::TEXT;
     RETURN;
   END IF;
 
-  IF p_outcome = 'failed' AND p_provider_message_id IS NOT NULL THEN
+  IF p_outcome IN ('failed', 'invalid_database_state') AND p_provider_message_id IS NOT NULL THEN
     RETURN QUERY SELECT false, 'finalize_invalid_provider_message_id'::TEXT;
     RETURN;
   END IF;
 
-  v_new_status := CASE WHEN p_outcome = 'sent' THEN 'sent' ELSE 'failed' END;
+  v_new_status := CASE WHEN p_outcome = 'sent' THEN 'sent' WHEN p_outcome = 'failed' THEN 'failed' ELSE 'invalid_database_state' END;
 
   SELECT * INTO v_event FROM quotation_delivery_events WHERE idempotency_key = p_idempotency_key FOR UPDATE;
 
@@ -469,11 +522,21 @@ Four release-blocking defects were found by a direct review of the initially com
 
 **3. `finalize_quotation_delivery` under-enforced the outcome/provider-id relationship and the reservation's own version integrity.** The function accepted `p_outcome = 'sent'` with a `NULL` or malformed `p_provider_message_id`, relying entirely on `Classify Send Result`'s n8n-layer validation rather than enforcing it itself — reproduced directly by calling `finalize_quotation_delivery('sent', NULL)` at the SQL layer, bypassing n8n entirely, and confirming it was accepted and durably recorded. It also checked the quotation's current version only against `quotation_delivery_state.reserved_version`, never against `quotation_delivery_events.reserved_version`, and never asserted either was non-null. **Fixed**: `finalize_quotation_delivery` now independently validates the outcome/provider-id relationship before touching any row (`sent` requires a genuine `^[A-Za-z0-9_.=-]+$` id of length 1–256; `failed` requires a null one — mutating nothing on failure, `finalize_invalid_provider_message_id`), the same relationship is additionally enforced as a `CHECK` constraint on `quotation_delivery_state` itself (`qds_provider_message_id_status_check`), and both rows' `reserved_version` must be non-null and mutually agree before the current quotation version is even checked. **A real implementation defect was caught by live-testing this fix itself**: the first draft used a `{1,256}` bound quantifier in a PL/pgSQL regex (`^[A-Za-z0-9_.=-]{1,256}$`), which threw `regular expression geçersiz: invalid repetition count(s)` — PostgreSQL's regex engine hard-caps repetition-count bounds at 255. Rewritten to `length(...) BETWEEN 1 AND 256 AND ... ~ '^[A-Za-z0-9_.=-]+$'`, matching the pattern the schema's own `CHECK` constraints already used for exactly this reason. All 8 mandatory cases (`sent`+null/empty/malformed/oversized id, `failed`+non-null id, event/state `reserved_version` disagreement, null `reserved_version` on either row, and the correct-owner happy path) verified directly against Postgres — every invalid case mutates nothing and the state stays `delivery_pending`.
 
-**4. The shipped configuration placeholder did not fail closed.** `QUOTATION_LINK_ORIGIN` (`'https://quotes.example.com/q/'`) is syntactically valid HTTPS — a deployment that forgot to replace it would reach a real WhatsApp send carrying a broken `example.com` link, since nothing previously distinguished "a real configured origin" from "the shipped placeholder." **Fixed** by adding `Load Configuration`, a new node that runs before any Postgres call and validates every hardcoded deployment constant, rejecting the shipped `PHONE_NUMBER_ID` and `QUOTATION_LINK_ORIGIN` placeholders with a controlled `configuration_required` result — zero database mutations, zero sender calls. `Build Send Request` now reads every configuration value from `Load Configuration`'s output rather than re-declaring its own copies, so the two sources can never diverge. **A real portability defect was caught by live-testing this fix itself**: the first draft's origin validator used `new URL(origin)`, which threw `ReferenceError: URL is not defined` inside n8n's own Code node sandbox — confirmed directly (`typeof URL` is `'undefined'` there, though it is an ordinary Node.js global everywhere else) — silently routing every request to `configuration_required` regardless of the configured origin's actual validity. Rewritten as a plain, dependency-free regex (see [Link security design](#link-security-design)), re-verified against 16 cases (valid hosts, the shipped placeholder, missing trailing slash, userinfo, query string, fragment, IP-literal/`localhost` placeholders, a backslash-confusable host, non-HTTPS, an empty host, garbage, empty, and null) and, live, against both the real committed workflow (shipped placeholder → `configuration_required`, zero Postgres calls) and a mock-bound copy with a real, non-placeholder configuration (→ a genuine successful send). The host character class was kept intentionally flat (`[A-Za-z0-9.-]+`, not a DNS-label-precise nested pattern) — both are equally safe against the actual threat model here (scheme/userinfo/port/query/fragment confusion), and the flatter form is simpler to read and maintain.
+**4. The shipped configuration placeholder did not fail closed.** `QUOTATION_LINK_ORIGIN` (`'https://quotes.example.com/q/'`) is syntactically valid HTTPS — a deployment that forgot to replace it would reach a real WhatsApp send carrying a broken `example.com` link, since nothing previously distinguished "a real configured origin" from "the shipped placeholder." **Fixed** by adding `Load Configuration`, a new node that runs before any Postgres call, rejecting the shipped `PHONE_NUMBER_ID` and `QUOTATION_LINK_ORIGIN` placeholders with a controlled `configuration_required` result — zero database mutations, zero sender calls. **A real portability defect was caught by live-testing this fix itself**: the first draft's origin validator used `new URL(origin)`, which threw `ReferenceError: URL is not defined` inside n8n's own Code node sandbox — confirmed directly (`typeof URL` is `'undefined'` there, though it is an ordinary Node.js global everywhere else) — silently routing every request to `configuration_required` regardless of the configured origin's actual validity. This validator (both the placeholder-detection logic and the `URL`-avoidance fix) was later superseded by a substantially more thorough one — see [Corrections applied after a second external adversarial review](#corrections-applied-after-a-second-external-adversarial-review), finding 3.
 
 **`quotations.link_token` now carries a `UNIQUE` constraint** (`quotations_link_token_unique`), not only the format `CHECK` — no two quotations can ever be issued the same delivery link.
 
 **The expiry boundary changed from exclusive to inclusive** (`valid_until < now()` → `valid_until <= now()`): a quotation whose valid-until instant is exactly "now" is treated as already expired, not valid for one more instant. Verified directly with a quotation seeded at `valid_until = now()` at insert time — reports `expired`.
+
+## Corrections applied after a second external adversarial review
+
+Three further release-blocking defects were found by a direct review of the corrections above and fixed on the same branch. Each was reproduced against the actual committed SQL/graph first, fixed, and re-verified — both at the SQL layer and through the real committed n8n graph — before being considered closed.
+
+**1. `valid_until` was not actually validated — PostgreSQL's `infinity`/`-infinity` timestamptz values bypassed the expiry check.** The documentation claimed every database-derived send field was validated before `delivery_pending` was created, but `process_quotation_delivery` only ever checked `valid_until <= now()`. `'infinity'::timestamptz <= now()` is `false` (infinity is never in the past), so an `infinity` `valid_until` passed the expiry check and would have reached the WhatsApp template as the literal string `"infinity"`; `'-infinity'::timestamptz <= now()` is `true`, so a `-infinity` value was mislabeled `expired` rather than honestly reported as corrupt data. Reproduced directly: seeded quotations with `valid_until = 'infinity'` and `'-infinity'` (via a temporary constraint bypass — `quotations_valid_until_finite_check` itself already blocks this at `INSERT` time under normal operation) and confirmed both outcomes. **Fixed** with `quotations_valid_until_finite_check CHECK (isfinite(valid_until))` at the schema layer, plus an explicit `NOT isfinite(v_quote.valid_until)` re-check inside `process_quotation_delivery` — checked *before* the expiry comparison, so both directions degrade uniformly to `invalid_database_state` rather than one of them slipping through as `expired`. Re-verified: both `infinity` and `-infinity` now return `owner_applied`/`invalid_database_state` with zero `quotation_delivery_state` rows created, at the SQL layer and live through the real committed graph (via a mock-bound copy with a real configuration, since the shipped committed workflow's placeholder config would otherwise mask this test behind `configuration_required`). Regression-confirmed: a normal past-dated `valid_until`, and the existing `valid_until = now()` inclusive boundary, are both unaffected.
+
+**2. The n8n-layer defense-in-depth rejection still stranded a `delivery_pending` reservation.** `Build Send Request` can route to a false branch after `process_quotation_delivery` has already committed `delivery_pending` — structurally should be unreachable now that the database layer validates the same fields itself (see finding 2 in the corrections above), but the review required this defense-in-depth path to have honest durable semantics regardless, since it is also a general-purpose function another caller could invoke directly. Previously this branch only returned `invalid_database_state` as a plain JSON response, without ever calling finalize — leaving the event and state rows stuck at `delivery_pending` with no path to resolution. **Fixed** by adding `Finalize Invalid Send Request`, a new Postgres node between the false branch and the response builder, calling the same `finalize_quotation_delivery` function used for real sends with a new third outcome, `'invalid_database_state'` (provider-message-id always `NULL`, since no sender call ever happened) — reusing its full ownership-verification logic rather than inventing a separate cleanup path. `finalize_quotation_delivery` now accepts `p_outcome IN ('sent', 'failed', 'invalid_database_state')`; `quotation_delivery_state.status` now allows `'invalid_database_state'` as a fourth value, and `process_quotation_delivery` blocks it from ever being silently reopened by a fresh key, the same way `reconciliation_required` is blocked — but as its own distinct state, since zero sender calls ever occurred here (no "may have already reached WhatsApp" ambiguity, just corrupt data needing manual correction). **Live-tested via a genuine, temporary test-only mismatch** between database acceptance and n8n validation: temporarily replaced `process_quotation_delivery` with a variant missing its own `link_token` re-validation (leaving the table's `CHECK` constraint as the only line of defense, itself bypassed for this one test), reserved a corrupted quotation, and confirmed the real graph now correctly finalizes it — `quotation_delivery_state.status` moved from `delivery_pending` to `invalid_database_state`, `quotation_delivery_events.result_status` recorded the same, zero mock sender calls, and a fresh-key retry was correctly blocked rather than silently resending. The test-only function variant was replaced with the real one immediately after, re-confirmed by reproducing the original reservation-time rejection again.
+
+**3. Deployment configuration validation was incomplete.** `Load Configuration` (added in the corrections above) validated only `PHONE_NUMBER_ID` (against a placeholder set) and `QUOTATION_LINK_ORIGIN` (against a regex that accepted invalid/deceptive hosts — leading/trailing dots, consecutive dots, labels starting/ending with a hyphen, and any host merely containing the string "example" rather than only genuine subdomains of the reserved example domains). `GRAPH_API_VERSION`, `TEMPLATE_NAME`, and `LANGUAGE_CODE` were not validated for format at all. **Fixed**: every one of the five hardcoded configuration values is now validated — see [Link security design](#link-security-design) for the full detail, including the hostname validator rewritten with plain string splitting and per-label checks (not one large nested regex, per explicit review requirement) and its dot-boundary-correct reserved-domain check. Verified against 39 unit cases (including the `quotesexample.net` lookalike-domain boundary case, confirming it is correctly *not* blocked) and live against both the real committed workflow (shipped placeholder → `configuration_required`, zero Postgres/sender calls) and a mock-bound copy with a real configuration (→ a genuine successful send).
 
 ## Sender sub-workflow binding
 
@@ -500,14 +563,15 @@ The complete state machine this workflow can leave a quotation in:
 | `sent` | The send succeeded and was finalized via the ownership-verified, version-guarded write — full success. |
 | `failed` | The send was attempted and definitively failed (any non-2xx status, a transport failure, or an internally-inconsistent malformed `sent` response), finalized via the ownership-verified write. **Retriable via a fresh `idempotencyKey`** — deliberately, since a synchronous non-2xx/transport-failure response means WhatsApp told us (or we can be reasonably confident) the message was not accepted. This is **not** the same as `reconciliation_required` below, and a fresh key targeting a `failed` quotation is allowed to open a brand-new reservation — verified directly, and re-confirmed as a regression check after the fix described in [Corrections applied after external adversarial review](#corrections-applied-after-external-adversarial-review). |
 | `reconciliation_required` | An **ambiguous** outcome: either the finalize call's ownership check failed (the event row no longer agreed with the state row it should own), the quotation moved on since this attempt's reservation, or the two reservation rows' `reserved_version` values were missing or disagreed. The row that failed ownership/version verification is left completely untouched, and — unlike `failed` — a fresh `idempotencyKey` targeting this quotation is explicitly blocked from opening a new reservation; a human or a separate reconciliation process must resolve this by hand first. See [Corrections applied after external adversarial review](#corrections-applied-after-external-adversarial-review) for the defect this closes. |
+| `invalid_database_state` as a durable `quotation_delivery_state.status` | **Not ambiguous** — zero sender calls ever occurred. Reached only via `Finalize Invalid Send Request`, the ownership-verified cleanup for the (structurally-should-be-unreachable) n8n-layer defense-in-depth rejection: `process_quotation_delivery` committed `delivery_pending`, but `Build Send Request`'s own re-validation then rejected the data anyway. The state is moved out of `delivery_pending` into this explicit manual-resolution state — a human must correct the underlying quotation's data before any further delivery attempt; a fresh `idempotencyKey` is explicitly blocked from reopening it, the same way `reconciliation_required` is. `invalid_database_state` also appears as an *event-only* outcome (no `quotation_delivery_state` row at all) when `process_quotation_delivery` itself rejects corrupt data or a non-finite `valid_until` before ever creating a reservation — see [Corrections applied after a second external adversarial review](#corrections-applied-after-a-second-external-adversarial-review). |
 
-Two further outcomes (`finalize_unknown_key`, `finalize_mismatch`) and two input-validation outcomes (`finalize_invalid_outcome`, `finalize_invalid_provider_message_id`) exist only as defense-in-depth responses from `finalize_quotation_delivery` itself against a finalize call with a nonexistent `idempotencyKey`, one that belongs to a genuinely different `quotationId`, a garbage `outcome` value, or an outcome/`provider_message_id` combination that violates the schema's own relationship between them — none of these are reachable through this workflow's own committed graph under normal operation, but the function refuses them regardless, mutating nothing, since it is also a general-purpose database function another caller could invoke directly.
+Two further outcomes (`finalize_unknown_key`, `finalize_mismatch`) and two input-validation outcomes (`finalize_invalid_outcome`, `finalize_invalid_provider_message_id`) exist only as defense-in-depth responses from `finalize_quotation_delivery` itself against a finalize call with a nonexistent `idempotencyKey`, one that belongs to a genuinely different `quotationId`, a garbage `outcome` value, or an outcome/`provider_message_id` combination that violates the schema's own relationship between them — none of these are reachable through this workflow's own committed graph under normal *sending* operation, but the function refuses them regardless, mutating nothing, since it is also a general-purpose database function another caller could invoke directly. `finalize_quotation_delivery` accepts three outcomes overall: `'sent'`, `'failed'`, and `'invalid_database_state'` (the last used only by `Finalize Invalid Send Request`, never by a real send).
 
 **If the process crashes after the atomic database write commits but before or during the send call**, the database durably and visibly shows `delivery_pending`. A duplicate request for the same `idempotencyKey` reports this exact pending state and makes zero new sends. A fresh `idempotencyKey` for the same `quotationId` is rejected as `delivery_pending` (if still genuinely in flight) or `already_delivered` (if it has since completed) — this workflow never allows a second overlapping attempt at the same quotation regardless of which idempotency key is used.
 
 **If the send itself succeeds or fails but the final Postgres write then fails** (e.g. Postgres becomes unreachable at exactly that moment), this workflow does **not** automatically retry the send — the message may already have reached WhatsApp, and retrying blindly risks a duplicate. The execution fails loudly (no `continueOnFail` on the finalize node), and the delivery state is left showing `delivery_pending` — its state from the initial atomic write — until a human or a separate reconciliation process checks WhatsApp's actual delivery state and updates Postgres by hand. Verified directly by isolating the finalize write against a deliberately unreachable Postgres connection after a successful mock send: exactly one send occurred, and the state remained durably `delivery_pending` — never falsely marked `sent`.
 
-**Resolving a stuck `delivery_pending` or `reconciliation_required` row is outside this workflow's scope.** It requires checking the actual delivery state on WhatsApp's side and manually updating `quotation_delivery_state` (and, if appropriate, `quotation_delivery_events.result_status`) — this workflow deliberately does not attempt that automatically.
+**Resolving a stuck `delivery_pending`, `reconciliation_required`, or `invalid_database_state` row is outside this workflow's scope.** The first two require checking the actual delivery state on WhatsApp's side; `invalid_database_state` instead requires correcting the underlying quotation's own data (it never reached the sender at all). In every case this means manually updating `quotation_delivery_state` (and, if appropriate, `quotation_delivery_events.result_status`) — this workflow deliberately does not attempt that automatically.
 
 ## Controlled output contract
 
@@ -519,7 +583,7 @@ Every execution branch returns exactly the same four-field shape — proven by c
 
 | Credential | Bound to node(s) | Type |
 |---|---|---|
-| e.g. "Quotations Postgres" | `Reserve And Apply`, `Finalize Send Result` | n8n **Postgres** credential (`postgres`), pointed at your own database with the schema and functions in [Atomic idempotency and ownership design](#atomic-idempotency-and-ownership-design) |
+| e.g. "Quotations Postgres" | `Reserve And Apply`, `Finalize Invalid Send Request`, `Finalize Send Result` | n8n **Postgres** credential (`postgres`), pointed at your own database with the schema and functions in [Atomic idempotency and ownership design](#atomic-idempotency-and-ownership-design) |
 
 The sender's own credential (its HTTP Header Auth WhatsApp access token) lives only in the already-committed [`whatsapp-template-message-sender`](whatsapp-template-message-sender.md) workflow — this workflow never touches it directly.
 
@@ -531,12 +595,12 @@ The sender's own credential (its HTTP Header Auth WhatsApp access token) lives o
 
 1. Create the schema — see [Atomic idempotency and ownership design](#atomic-idempotency-and-ownership-design) for a new installation.
 2. Import `customer-quotation-delivery.json`.
-3. Create and bind your Postgres credential (see [Required credentials](#required-credentials)) to `Reserve And Apply` and `Finalize Send Result`.
+3. Create and bind your Postgres credential (see [Required credentials](#required-credentials)) to `Reserve And Apply`, `Finalize Invalid Send Request`, and `Finalize Send Result`.
 4. Ensure [`whatsapp-template-message-sender.json`](whatsapp-template-message-sender.json) is already imported (with its own WhatsApp credential bound) — if you imported it via the official CLI or the editor's normal import feature without changing its id, `Call Sender`'s reference resolves automatically.
-5. **Edit `Load Configuration`'s hardcoded constants before real use**: `PHONE_NUMBER_ID` to your real WhatsApp Business phone number id, `TEMPLATE_NAME` to your own real, Meta-approved template name, and — critically — `QUOTATION_LINK_ORIGIN` to your own real, HTTPS quotation-viewing page's origin. This workflow ships with placeholder values (including an `example.com` link origin), and `Load Configuration` will refuse to proceed past them — `configuration_required`, zero database or sender calls — until you replace them (`Build Send Request` reads every one of these values from `Load Configuration`'s output, so there is only one place to edit).
+5. **Edit `Load Configuration`'s hardcoded constants before real use**: `GRAPH_API_VERSION` to Meta's currently-supported Graph API version, `PHONE_NUMBER_ID` to your real WhatsApp Business phone number id, `TEMPLATE_NAME` to your own real, Meta-approved template name, `LANGUAGE_CODE` to your template's language, and — critically — `QUOTATION_LINK_ORIGIN` to your own real, HTTPS quotation-viewing page's origin (a fixed scheme + a well-formed, multi-label hostname + a trailing-slash path — see [Link security design](#link-security-design) for the exact format required). This workflow ships with placeholder values, and `Load Configuration` will refuse to proceed past any of them — `configuration_required`, zero database or sender calls — until every one is replaced with a real, correctly formatted value (`Build Send Request` reads every one of these values from `Load Configuration`'s output, so there is only one place to edit).
 6. Populate `quotations` from your real quotation data however you already do that — this workflow does not create quotations, calculate their contents, or generate `link_token` values itself; your application must generate a genuinely unguessable, unique token per quotation and store it there.
 7. Build whatever calls this sub-workflow — a sales action or automated job that decides *which* approved quotation is worth delivering right now, and calls this workflow once per candidate, passing a fresh `idempotencyKey` per attempt, the `quotationId`, and `expectedVersion` looked up from your own quotation records. **Do not pass a recipient phone, quotation values, or a link** — none of these are part of this workflow's input contract.
-8. Have a plan for resolving `delivery_pending`/`reconciliation_required` rows that don't clear on their own — see [Crash and reconciliation behavior](#crash-and-reconciliation-behavior). This workflow does not do this automatically.
+8. Have a plan for resolving `delivery_pending`/`reconciliation_required`/`invalid_database_state` rows that don't clear on their own — see [Crash and reconciliation behavior](#crash-and-reconciliation-behavior). This workflow does not do this automatically.
 9. Test with synthetic data against your own isolated setup first.
 
 ## Test procedure
@@ -614,6 +678,26 @@ A follow-up round after all four findings in [Corrections applied after external
 | 41 | Full regression sweep after all fixes: happy-path send, draft/cancelled/rejected/accepted/expired/missing/conflict, oversized-id and missing-field input validation, sender HTTP 400/500/malformed-2xx/timeout, sequential duplicate replay, concurrent idempotency-key race (`BEGIN`/`pg_sleep` technique against the fixed schema), idempotency mismatch | Every case: identical, correct behavior to the original 29-scenario suite — no regression introduced by the graph restructuring (`Load Configuration`/`Configuration Valid?` insertion) or the schema changes. Mock call count matched the exact number of legitimate sends across the whole regression run | mock-bound copy, real n8n execution, direct SQL |
 | 42 | Portability re-verification: official CLI export of the corrected workflow, content-diffed field-by-field (`nodes`, `connections`, `settings`) against the hand-built corrected draft | Byte-for-byte identical | real committed file |
 
+### Corrections retest — second external adversarial review
+
+A follow-up round after all three findings in [Corrections applied after a second external adversarial review](#corrections-applied-after-a-second-external-adversarial-review) were fixed. Run against a fresh Postgres instance with the corrected schema, and a fresh n8n test instance with the corrected workflow re-imported.
+
+| # | Test | Result | Verified via |
+|---|---|---|---|
+| 43 | **Finding 1** — `valid_until = 'infinity'`, reservation attempted (via a temporary constraint bypass, since `quotations_valid_until_finite_check` itself already blocks this at `INSERT` time under normal operation) | `owner_applied`/`invalid_database_state`, zero `quotation_delivery_state` rows created | direct SQL |
+| 44 | `valid_until = '-infinity'`, same technique | `owner_applied`/`invalid_database_state` (not `expired` — the isfinite check runs before the expiry comparison so both directions are caught uniformly), zero `quotation_delivery_state` rows | direct SQL |
+| 45 | Regression: a normal past-dated `valid_until`, and the existing `valid_until = now()` inclusive boundary | Both unaffected: `expired` in both cases | direct SQL |
+| 46 | **Finding 1 live** — `valid_until = 'infinity'` through the real n8n graph (mock-bound copy, real configuration) | `invalid_database_state`, mock call count unchanged (zero sends) | real n8n execution |
+| 47 | **Finding 2** — `finalize_quotation_delivery` called with the new `'invalid_database_state'` outcome after a real `delivery_pending` reservation | `quotation_delivery_state.status` moves to `invalid_database_state`, `provider_message_id` stays `NULL`, `quotation_delivery_events.result_status` recorded the same | direct SQL |
+| 48 | `'invalid_database_state'` outcome + non-null `provider_message_id` | Rejected (`finalize_invalid_provider_message_id`), zero mutation, state remains `delivery_pending` | direct SQL |
+| 49 | Fresh-key retry against a quotation already in `invalid_database_state` | Blocked — `invalid_database_state` returned again, the existing state row's `active_idempotency_key` left untouched, matching `reconciliation_required`'s reopening protection | direct SQL |
+| 50 | **Finding 2 live** — a genuine, temporary test-only mismatch between database acceptance and n8n validation: `process_quotation_delivery` temporarily replaced with a variant omitting its own `link_token` re-validation, a quotation with a corrupted `link_token` reserved, then delivered through the real mock-bound graph | Before: `delivery_pending` reserved despite the corrupt data (confirming the mismatch condition). After the live execution: `quotation_delivery_state.status` = `invalid_database_state`, `quotation_delivery_events.result_status` = `invalid_database_state`, zero mock sender calls (call count unchanged), and a fresh-key retry immediately afterward was correctly blocked rather than silently resending (mock call count still unchanged) | real n8n execution against the mock-bound copy |
+| 51 | Restoration check: the real, fully-validating `process_quotation_delivery` reinstalled immediately after row 50, reproducing the original reservation-time rejection | `owner_applied`/`invalid_database_state` at reservation time again, zero `quotation_delivery_state` rows — confirms the test-only variant left no lasting effect | direct SQL |
+| 52 | **Finding 3** — configuration validator: valid production-shaped configuration; every shipped placeholder; malformed `GRAPH_API_VERSION`/`PHONE_NUMBER_ID`/`TEMPLATE_NAME`/`LANGUAGE_CODE`; leading-dot/trailing-dot/consecutive-dot host; leading/trailing-hyphen DNS label; `example.com`/`.org`/`.net` and genuine subdomains of them; the `quotesexample.net` lookalike (must NOT be blocked); `localhost`; IPv4 and IPv6 literals; userinfo, port, query, fragment, and backslash-confusable origins; non-HTTPS origin; valid multi-label HTTPS origin with single- and multi-segment paths (39 cases total) | All 39 cases match expected — every malformed/placeholder/deceptive value rejected, every genuinely valid value and the lookalike domain accepted | unit test (39 cases), run against the exact generated node code (not just the isolated function) |
+| 53 | **Finding 3 live** — shipped placeholder configuration against the real committed workflow; a mock-bound copy with a real, non-placeholder configuration | Shipped: `configuration_required`, zero Postgres/sender calls. Real config: genuine successful send (`sent`, HTTP 200, a real mock provider message id) | real n8n execution |
+| 54 | Full regression sweep after all three fixes: happy-path send, draft/cancelled/expired quotations, sender HTTP 400, missing quotation | Every case: identical, correct behavior to the prior 42-scenario suite — no regression introduced by the new `Finalize Invalid Send Request` node, the restructured `Load Configuration`, or the schema changes | mock-bound copy, real n8n execution |
+| 55 | Portability re-verification: official CLI export of the doubly-corrected workflow, content-diffed field-by-field (`nodes`, `connections`, `settings`) against the hand-built corrected draft, then re-imported into a **second**, fully independent clean n8n instance + fresh Postgres database | Byte-for-byte identical on both counts. Sender-by-id reference confirmed to resolve without manual rebinding on the second instance: a live execution completed successfully (`status: "success"`) and reached the expected `configuration_required` controlled response rather than an Execute Workflow "workflow not found" error | real committed file, second fully independent clean instance |
+
 The committed JSON was produced by an official CLI export, then had n8n's own instance-specific metadata fields (`active`, `createdAt`, `updatedAt`, `versionId`, `triggerCount`, and similar) stripped to match every other workflow package in this repository's identical committed shape (`connections`, `id`, `meta`, `name`, `nodes`, `pinData`, `settings`, `staticData`, `tags`) — confirmed field-by-field that this stripping changed nothing about the nodes, connections, or settings themselves.
 
 All test data was synthetic: fake quotation/phone/idempotency-key/link-token identifiers, a fake bearer token clearly labeled `SYNTHETIC_TEST_TOKEN`, and a local mock server — no real Postgres database, WhatsApp/Meta credentials, or customer data anywhere.
@@ -625,9 +709,9 @@ All test data was synthetic: fake quotation/phone/idempotency-key/link-token ide
 - **"Sent" means the WhatsApp API accepted the message — not delivered, read, or acted on.** See [Exact scope](#exact-scope).
 - **Assumes a 2-decimal currency exponent.** `total_minor_units` formatting divides by 100 (via string slicing, not floating-point arithmetic) for every currency — this is correct for EUR/USD/GBP and most ISO 4217 currencies, but incorrect for 0-decimal currencies (e.g. JPY) or 3-decimal currencies (e.g. BHD, KWD) without extension.
 - **Does not decide which quotation is worth delivering, or when.** That decision is entirely outside this workflow's scope — it only verifies eligibility for and applies a single already-decided delivery attempt.
-- **A stuck `delivery_pending` or `reconciliation_required` row requires manual or separate-workflow resolution.** This workflow deliberately never automatically retries a send for a pending or unresolved delivery, because a prior request may already have reached WhatsApp.
+- **A stuck `delivery_pending` or `reconciliation_required` row requires manual or separate-workflow resolution.** This workflow deliberately never automatically retries a send for a pending or unresolved delivery, because a prior request may already have reached WhatsApp. A stuck `invalid_database_state` row is different — zero sender calls ever occurred for it — but still requires manual correction of the underlying quotation's data before any further attempt; see [Crash and reconciliation behavior](#crash-and-reconciliation-behavior).
 - **A compromised Postgres or WhatsApp sender credential defeats this workflow's own guarantees entirely** — the optimistic-concurrency and idempotency mechanisms protect against races and duplicate processing, not against a credential that shouldn't have been trusted in the first place.
-- **The shipped `PHONE_NUMBER_ID`/`QUOTATION_LINK_ORIGIN` placeholders are rejected by `Load Configuration` until replaced** — see [Setup steps](#setup-steps) and [Corrections applied after external adversarial review](#corrections-applied-after-external-adversarial-review). This only catches the *shipped* placeholder values; it cannot detect a real-looking but still-wrong configuration (e.g. the correct format but the wrong business's phone number id).
+- **Every shipped configuration placeholder, and every malformed configuration value, is rejected by `Load Configuration` until replaced with a correctly formatted real value** — see [Setup steps](#setup-steps), [Link security design](#link-security-design), and [Corrections applied after a second external adversarial review](#corrections-applied-after-a-second-external-adversarial-review). This still cannot detect a real-looking, correctly formatted, but *substantively* wrong configuration (e.g. the right format but the wrong business's phone number id, or a genuine but unintended hostname) — format and known-placeholder validation is not the same as verifying the value is actually correct for your deployment.
 - **No automatic retries, intentionally, anywhere.**
 - **Execution access through the n8n API is disabled and the execution is soft-deleted immediately.** Physical removal is handled separately by n8n's pruning configuration — see [Test procedure](#test-procedure) for exactly what was and wasn't directly observed in this workflow's own testing.
 - **The real Meta/WhatsApp API was never contacted during testing** — send behavior was verified only through a temporary, uncommitted mock-bound copy, disclosed precisely above. Verify against your own real, non-production WhatsApp Business setup before relying on this.
