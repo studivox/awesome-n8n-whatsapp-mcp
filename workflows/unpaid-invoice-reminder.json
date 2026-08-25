@@ -1,0 +1,483 @@
+{
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Reserve And Apply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Rejected Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserve And Apply": {
+      "main": [
+        [
+          {
+            "node": "Classify Reserve Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Reserve Result": {
+      "main": [
+        [
+          {
+            "node": "Needs Send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Send?": {
+      "main": [
+        [
+          {
+            "node": "Build Send Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Status Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Send Request": {
+      "main": [
+        [
+          {
+            "node": "Call Sender",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Sender": {
+      "main": [
+        [
+          {
+            "node": "Classify Send Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Send Result": {
+      "main": [
+        [
+          {
+            "node": "Finalize Send Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Send Result": {
+      "main": [
+        [
+          {
+            "node": "Build Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "id": "MTi5FI3RnApCrpgv",
+  "meta": null,
+  "name": "Unpaid Invoice Reminder",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "idempotencyKey",
+              "type": "string"
+            },
+            {
+              "name": "invoiceId",
+              "type": "string"
+            },
+            {
+              "name": "reminderStage",
+              "type": "string"
+            },
+            {
+              "name": "expectedVersion",
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "trigger",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "content": "## Unpaid Invoice Reminder\\n\\n- **Consumes** an already-decided reminder attempt (`invoiceId` + `reminderStage`) from whatever orchestrator decided a reminder is worth attempting -- this workflow does not decide reminder cadence/policy itself, it only verifies eligibility against Postgres and applies it safely.\\n- **recipientPhone, amount, currency, due date are NOT caller inputs.** All read exclusively from Postgres (`invoices`) -- arbitrary caller data can never redirect or fabricate a reminder.\\n- **Idempotency reservation and the eligibility decision happen in ONE atomic PL/pgSQL function** (`process_invoice_reminder`), modeled directly on `process_reply_event`'s proven exception-safe ownership gate.\\n- **Only genuinely unpaid, overdue, not-already-reminded invoices reach the sender.**\\n- **Final send-result writes are version-guarded** -- a slow execution can never overwrite reminder state after a newer invoice state has already committed; such cases are marked `reconciliation_required`, never false success.\\n- **No automatic retries anywhere in this workflow.**",
+        "height": 460,
+        "width": 660
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -720
+      ],
+      "id": "scopeNote",
+      "name": "Scope Notes"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Validates a reminder-attempt request from an already-deciding orchestrator.\n// Does NOT decide reminder cadence/policy -- that decision (which stage,\n// whether it's worth attempting) lives entirely outside this workflow.\n//\n// recipientPhone/amount/currency/dueDate are NOT input fields -- read\n// exclusively from Postgres (invoices) later in this workflow. Accepting\n// them from the caller would let arbitrary caller-controlled data redirect\n// or fabricate a reminder; Postgres is the source of truth for all of them.\n//\n// reminderStage is strictly allowlisted, not an arbitrary string -- it\n// selects a trusted, hardcoded template/language pair later in this\n// workflow (see Build Send Request), never caller-controlled template\n// content.\n\nconst input = $input.first().json;\n\nfunction isValidOpaqueId(v, maxLength) {\n  return typeof v === 'string' && v.length >= 1 && v.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(v);\n}\nfunction isValidReminderStage(v) {\n  return v === 'stage1' || v === 'stage2' || v === 'final';\n}\nfunction isValidExpectedVersion(v) {\n  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 1000000000;\n}\n\nconst idempotencyKey = input.idempotencyKey;\nconst invoiceId = input.invoiceId;\nconst reminderStage = input.reminderStage;\nconst expectedVersion = input.expectedVersion;\n\nconst idempotencyKeyValid = isValidOpaqueId(idempotencyKey, 128);\nconst invoiceIdValid = isValidOpaqueId(invoiceId, 128);\nconst reminderStageValid = isValidReminderStage(reminderStage);\nconst expectedVersionValid = isValidExpectedVersion(expectedVersion);\n\nconst valid = idempotencyKeyValid && invoiceIdValid && reminderStageValid && expectedVersionValid;\n\nif (!valid) {\n  return [{ json: {\n    _route: 'rejected',\n    invoiceId: invoiceIdValid ? invoiceId : null,\n  } }];\n}\n\nreturn [{ json: {\n  _route: 'valid',\n  idempotencyKey, invoiceId, reminderStage, expectedVersion,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "id": "validateInput",
+      "name": "Validate Input"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "valid",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        520,
+        0
+      ],
+      "id": "ifValid",
+      "name": "Input Valid?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached only when input validation failed -- zero database and zero\n// sender-workflow calls were made, structurally guaranteed (this node only\n// runs from the \"Input Valid?\" IF node's false output, before any Postgres\n// or Execute Workflow node in this workflow).\n\nconst item = $input.first().json;\nreturn [{ json: {\n  status: 'rejected',\n  invoiceId: item.invoiceId,\n  reminderStage: null,\n  httpStatus: null,\n  providerMessageId: null,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ],
+      "id": "buildRejected",
+      "name": "Build Rejected Response"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM process_invoice_reminder($1, $2, $3, $4);\n",
+        "options": {
+          "queryReplacement": "={{ [$json.idempotencyKey, $json.invoiceId, $json.reminderStage, $json.expectedVersion] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        780,
+        -160
+      ],
+      "id": "reserveApply",
+      "name": "Reserve And Apply"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Classifies process_invoice_reminder(...)'s result. `route` is one of:\n//   'owner_applied'       -- this call owns the idempotency reservation;\n//                            result_status is the actual outcome (which\n//                            may itself be terminal, or 'reminder_pending'\n//                            if a sender call is still needed).\n//   'duplicate_match'     -- idempotencyKey already reserved by an\n//                            IDENTICAL prior request (same invoiceId and\n//                            reminderStage) -- result_status is that prior\n//                            request's real, durable outcome.\n//   'idempotency_mismatch'-- idempotencyKey already reserved by a\n//                            DIFFERENT request (different invoiceId or\n//                            reminderStage) -- zero mutation of any\n//                            invoice occurred for this call.\n//\n// Every route except \"owner_applied with result_status = reminder_pending\"\n// is immediately terminal -- no sender call is ever reachable from this\n// node except via that one specific path.\n//\n// Defense in depth: result_status is allowlist-checked before it can ever\n// become part of this workflow's controlled output. Postgres's own CHECK\n// constraint already bounds what invoice_reminder_events.result_status can\n// durably contain, but this node never trusts that as the only line of\n// defense -- an unrecognized value (a future schema drift, a manual DB\n// edit, a bug) becomes a fixed literal, never an arbitrary database value\n// surfaced verbatim to a caller.\n\nconst KNOWN_STATUSES = new Set([\n  'missing_invoice', 'conflict', 'paid', 'cancelled', 'disputed', 'not_due',\n  'already_reminded', 'reminder_pending', 'reminder_sent', 'reminder_failed',\n  'reconciliation_required', 'idempotency_mismatch',\n]);\nfunction sanitizeStatus(v) {\n  return (typeof v === 'string' && KNOWN_STATUSES.has(v)) ? v : 'invalid_database_state';\n}\n\nconst result = $input.first().json;\nconst validated = $('Validate Input').first().json;\n\nconst resultStatus = sanitizeStatus(result.result_status);\nconst needsSend = result.route === 'owner_applied' && resultStatus === 'reminder_pending';\n\nreturn [{ json: {\n  _route: needsSend ? 'needs_send' : 'finalized',\n  resultStatus,\n  idempotencyKey: validated.idempotencyKey,\n  invoiceId: validated.invoiceId,\n  reminderStage: validated.reminderStage,\n  expectedVersion: validated.expectedVersion,\n  recipientPhone: result.out_recipient_phone,\n  amount: result.out_amount,\n  currency: result.out_currency,\n  dueDate: result.out_due_date,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        -160
+      ],
+      "id": "classifyReserve",
+      "name": "Classify Reserve Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._route }}",
+              "rightValue": "needs_send",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1300,
+        -160
+      ],
+      "id": "ifNeedsSend",
+      "name": "Needs Send?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached for: duplicate replays, idempotency mismatches, missing\n// invoices, version conflicts, paid/cancelled/disputed invoices,\n// not-yet-due invoices, and already-reminded stages. None of these paths\n// reach the sender sub-workflow -- structurally guaranteed by the IF node\n// that routes here.\n\nconst classified = $('Classify Reserve Result').first().json;\n\nreturn [{ json: {\n  status: classified.resultStatus,\n  invoiceId: classified.invoiceId,\n  reminderStage: classified.reminderStage,\n  httpStatus: null,\n  providerMessageId: null,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        140
+      ],
+      "id": "buildStatusResponse",
+      "name": "Build Status Response"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Builds the sender sub-workflow's request for confirmed-eligible\n// reminders only -- reached only after Postgres durably recorded\n// 'reminder_pending' for this (invoiceId, reminderStage) pair. The\n// recipient phone comes EXCLUSIVELY from Postgres (read back from the\n// atomic reservation call) -- never from caller input. templateName,\n// languageCode, graphApiVersion, and phoneNumberId are all trusted,\n// hardcoded configuration -- not caller input, not \"reminder policy\"\n// arbitrarily chosen by whoever calls this workflow.\n\nconst c = $input.first().json;\n\n// Replace with your own real WhatsApp Business phone number id before use.\nconst GRAPH_API_VERSION = 'v21.0';\nconst PHONE_NUMBER_ID = '000000000000000';\n\nconst STAGE_TEMPLATES = {\n  stage1: { templateName: 'invoice_reminder_first', languageCode: 'en' },\n  stage2: { templateName: 'invoice_reminder_second', languageCode: 'en' },\n  final: { templateName: 'invoice_reminder_final', languageCode: 'en' },\n};\n\nconst tpl = STAGE_TEMPLATES[c.reminderStage];\n\nreturn [{ json: {\n  idempotencyKey: c.idempotencyKey,\n  invoiceId: c.invoiceId,\n  reminderStage: c.reminderStage,\n  expectedVersion: c.expectedVersion,\n  recipientPhone: c.recipientPhone,\n  templateName: tpl.templateName,\n  languageCode: tpl.languageCode,\n  graphApiVersion: GRAPH_API_VERSION,\n  phoneNumberId: PHONE_NUMBER_ID,\n  bodyParameters: [c.amount, c.currency, c.dueDate],\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        -320
+      ],
+      "id": "buildSendRequest",
+      "name": "Build Send Request"
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "mode": "id",
+          "value": "R1QDUW9jYqxREyDS",
+          "cachedResultName": "WhatsApp Template Message Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "recipientPhone": "={{ $json.recipientPhone }}",
+            "templateName": "={{ $json.templateName }}",
+            "languageCode": "={{ $json.languageCode }}",
+            "graphApiVersion": "={{ $json.graphApiVersion }}",
+            "phoneNumberId": "={{ $json.phoneNumberId }}",
+            "bodyParameters": "={{ $json.bodyParameters }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "recipientPhone",
+              "displayName": "recipientPhone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "templateName",
+              "displayName": "templateName",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "languageCode",
+              "displayName": "languageCode",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "graphApiVersion",
+              "displayName": "graphApiVersion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "phoneNumberId",
+              "displayName": "phoneNumberId",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "bodyParameters",
+              "displayName": "bodyParameters",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "array"
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1820,
+        -320
+      ],
+      "id": "callSender",
+      "name": "Call Sender"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Classifies the sender sub-workflow's own controlled output\n// ({status, httpStatus, providerMessageId} -- see\n// whatsapp-template-message-sender.json). A send is only ever treated as\n// successful when EVERY field is mutually consistent -- status exactly\n// 'sent', httpStatus a genuine 2xx integer, and providerMessageId a\n// non-empty, bounded, safely-charactered identifier. The sender can\n// return status:'sent' with a null providerMessageId for a malformed 2xx\n// provider response (missing `messages` field) -- that is a malformed\n// send, not a genuine one, and must never be recorded as reminder_sent.\n\nfunction isValidProviderMessageId(v) {\n  return typeof v === 'string' && v.length >= 1 && v.length <= 256 && /^[A-Za-z0-9_.=-]+$/.test(v);\n}\n\nconst resp = $input.first().json;\nconst req = $('Build Send Request').first().json;\n\nconst httpStatusValid = typeof resp.httpStatus === 'number' && Number.isInteger(resp.httpStatus);\nconst httpStatusOk = httpStatusValid && resp.httpStatus >= 200 && resp.httpStatus < 300;\nconst providerMessageIdValid = isValidProviderMessageId(resp.providerMessageId);\n\n// Every field must agree before this counts as a genuine success.\nconst sentValid = resp.status === 'sent' && httpStatusOk && providerMessageIdValid;\nconst outcome = sentValid ? 'sent' : 'failed';\n\nreturn [{ json: {\n  outcome,\n  idempotencyKey: req.idempotencyKey,\n  invoiceId: req.invoiceId,\n  reminderStage: req.reminderStage,\n  httpStatus: httpStatusValid ? resp.httpStatus : null,\n  // Non-sent (and internally-inconsistent sent-shaped) outcomes never\n  // retain a provider message id -- there is nothing genuinely confirmed.\n  providerMessageId: sentValid ? resp.providerMessageId : null,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        -320
+      ],
+      "id": "classifySendResult",
+      "name": "Classify Send Result"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM finalize_invoice_reminder($1, $2, $3, $4, $5);\n",
+        "options": {
+          "queryReplacement": "={{ [$json.idempotencyKey, $json.invoiceId, $json.reminderStage, $json.outcome, $json.providerMessageId] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2340,
+        -320
+      ],
+      "id": "finalize",
+      "name": "Finalize Send Result"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Reached after the version-guarded finalize write. If ownership no\n// longer matches (a newer attempt or state already owns this invoice/\n// stage, or the invoice moved on since this attempt's reservation), the\n// result is 'reconciliation_required' -- never falsely reported as full\n// success -- and the newer/current state was never touched. A replay\n// against an already-terminal attempt returns that attempt's real,\n// existing result, never flips it.\n//\n// Defense in depth: out_result_status is allowlist-checked before\n// becoming this workflow's controlled `status` -- an unrecognized value\n// becomes a fixed literal, never an arbitrary database value surfaced\n// verbatim.\n\nconst KNOWN_STATUSES = new Set([\n  'reminder_sent', 'reminder_failed', 'reconciliation_required',\n  'finalize_unknown_key', 'finalize_mismatch', 'finalize_invalid_outcome',\n]);\nfunction sanitizeStatus(v) {\n  return (typeof v === 'string' && KNOWN_STATUSES.has(v)) ? v : 'invalid_database_state';\n}\n\nconst finalizeResult = $input.first().json;\nconst classified = $('Classify Send Result').first().json;\n\nreturn [{ json: {\n  status: sanitizeStatus(finalizeResult.out_result_status),\n  invoiceId: classified.invoiceId,\n  reminderStage: classified.reminderStage,\n  httpStatus: classified.httpStatus,\n  providerMessageId: classified.providerMessageId,\n} }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        -320
+      ],
+      "id": "buildFinalizeResponse",
+      "name": "Build Finalize Response"
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": null,
+  "tags": []
+}
